@@ -120,3 +120,36 @@ fig.tight_layout()
 fig.savefig(os.path.join(OUT, "bundle-vs-singles.svg"), transparent=True)
 plt.close(fig)
 print("wrote docs/assets/bundle-vs-singles.svg")
+
+# ------------------------------- chart 3: FLQ vs reference codecs
+# output size as % of source on the 47 corpus files every tool accepted
+# (identical inputs — see testdata/results/2026-10-22_e254a5b.md).
+ref = [
+    ("Zstd --ultra -22", 78.08, MUT),
+    ("7-Zip LZMA2 -mx9", 64.60, MUT),
+    ("WavPack -hx", 52.04, BLUE),
+    ("FLAC -8", 51.15, BLUE),
+    ("Monkey's Audio -c4000", 50.85, BLUE),
+    ("FLQ", 50.51, ORANGE),
+    ("TAK -p4m", 49.88, BLUE),
+    ("OptimFROG extranew-light", 48.40, BLUE),
+]
+fig, ax = plt.subplots(figsize=(7.2, 3.2))
+bars = ax.barh([n for n, _, _ in ref], [v for _, v, _ in ref],
+               color=[c for _, _, c in ref], height=0.62)
+for b, v in zip(bars, [v for _, v, _ in ref]):
+    ax.text(v + 1.0, b.get_y() + b.get_height() / 2, f"{v:.1f}%",
+            va="center", fontsize=9, color=MUT)
+ax.set_xlim(0, 90)
+ax.set_xlabel("output size, % of source — identical 47-file subset, lower is better",
+              fontsize=9, color=MUT)
+ax.tick_params(labelsize=9, colors=MUT, length=0)
+for s in ("top", "right"):
+    ax.spines[s].set_visible(False)
+for s in ("left", "bottom"):
+    ax.spines[s].set_color(MUT)
+fig.patch.set_alpha(0); ax.set_facecolor("none")
+fig.tight_layout()
+fig.savefig(os.path.join(OUT, "vs-reference-codecs.svg"), transparent=True)
+plt.close(fig)
+print("wrote docs/assets/vs-reference-codecs.svg")

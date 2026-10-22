@@ -34,6 +34,8 @@ Agents NEVER run `git commit` — the user commits manually. Prepare changes, re
 
 `sample_pack/` (gitignored) is a ~258-file audio corpus (wav/mp3/flac/aiff/ogg/m4a, incl. corrupted FLACs and MPEG-2.5 radio captures) used for format sweeps. Sweep scripts/logs live outside the repo; keep it that way — don't commit sweep tooling or raw logs.
 
+Codec A/B bench: `D:\TEMP\flq_ab\bench.py` compares FLQ vs FLAC/WavPack/OFR/TAK/APE/7z/zstd/paq8px single-file on the wav/aiff subset; results in `testdata/results/2026-10-22_e254a5b.md`. Reference binaries live under `D:\TEMP\flq_ab\` too (nothing external is committed).
+
 ## Test data & results
 
 `testdata/` holds ALL tracked test/bench inputs — tests must not read files elsewhere in the repo:
@@ -48,7 +50,7 @@ Measurement runs write `testdata/results/YYYY-MM-DD[_tag].md` — ONE file per r
 ## CLI
 
 ```powershell
-.\target\release\flq.exe encode a.wav b.flac out.flq  # .wav .aiff/.aif/.aifc .flac .mp3 .m4a/.mp4 .aac .ogg, refuses to overwrite
+.\target\release\flq.exe encode [--no-joint] a.wav b.flac out.flq  # .wav .aiff/.aif/.aifc .flac .mp3 .m4a/.mp4 .aac .ogg, refuses to overwrite; --no-joint skips all reference analysis (ablation)
 .\target\release\flq.exe decode out.flq [-o dir] [--format flac|wav] [--only name ...]   # default dir: out_decoded, refuses to overwrite; --only decodes just the named tracks (refs/mode-2 chain deps are decoded internally, never written)
 .\target\release\flq.exe bench a.wav b.mp3            # in-memory encode+decode, sizes/gains/MP3 structure/time/cpu/heap/accuracy
 ```
@@ -72,7 +74,7 @@ Reference results: birds_singing.wav + frogs_croaking.wav: 20,900,976 B -> 8,055
 - `src/formats.rs` — format sniffing, Symphonia FLAC/ALAC decode, tag blobs, flacenc encode + splice + re-decode verify, `decode_pcm`
 - `src/codec.rs` — float split, stereo modes, LPC, block plan/write/read
 - `src/joint.rs` — FFT NCC analysis, per-block reference choice
-- `src/container.rs` — public API: `encode`, `decode`, `decode_subset`, `decode_pcm`, `Stats`; container v3 (kinds 0 WAV, 1 MP3, 2 AIFF, 3 PCM, 4 raw; v1/v2 files still decode)
+- `src/container.rs` — public API: `encode`, `encode_opts` (`joint=false` = `--no-joint` ablation), `decode`, `decode_subset`, `decode_pcm`, `Stats`; container v3 (kinds 0 WAV, 1 MP3, 2 AIFF, 3 PCM, 4 raw; v1/v2 files still decode)
 - `src/mp3/` — MPEG-1 L3 parser: `mod.rs` item scan/rebuild/stats, `frame.rs` header/side-info/granule decode+encode, `huffman.rs` tree decode + derived encode tables, `tables.rs` vendored Annex-B tables (credit: puremp3, MIT/CC0), `rc.rs` LZMA-style adaptive range coder, `model.rs` context-modeled serializer (container MP3 mode 1)
 - `src/main.rs` — CLI + metrics (counting allocator for peak heap, `GetProcessTimes` for CPU)
 

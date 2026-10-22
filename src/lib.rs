@@ -9,6 +9,6 @@ mod wav;
 
 pub use container::{
     DecodedPcm, Input, Output, PcmOut, Stats, TrackKind, TrackStats, decode, decode_pcm,
-    decode_subset, encode, tag_blocks,
+    decode_subset, encode, encode_opts, tag_blocks,
 };
 pub use mp3::Mp3Stats;

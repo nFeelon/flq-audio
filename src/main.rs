@@ -1,5 +1,5 @@
 use flq::{
-    Input, PcmOut, Stats, TrackKind, TrackStats, decode, decode_pcm, decode_subset, encode,
+    Input, PcmOut, Stats, TrackKind, TrackStats, decode, decode_pcm, decode_subset, encode_opts,
     tag_blocks,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -10,12 +10,21 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
-  flq encode <in1> <in2> [more ...] <out.flq>
+  flq encode [--no-joint] <in1> <in2> [more ...] <out.flq>
        inputs: .wav .aiff/.aif/.aifc .flac .mp3 .m4a/.mp4 (ALAC or AAC) .aac .ogg (Vorbis/Opus)
+       --no-joint disables all reference analysis (plain LPC/Rice coding)
   flq decode <in.flq> [-o <dir>] [--format flac|wav] [--only <name> [<name> ...]]
        --format picks the output of FLAC/ALAC tracks (default: flac)
        --only decodes just the named tracks (dependencies are decoded too)
-  flq bench  <in1> <in2> [more ...]   # same inputs as encode";
+  flq bench  [--no-joint] <in1> <in2> [more ...]   # same inputs as encode";
+
+/// Split `encode`/`bench` args into (paths, joint): `--no-joint` is the only
+/// flag and may appear anywhere among the inputs.
+fn positional(args: &[String]) -> (Vec<String>, bool) {
+    let joint = !args.iter().any(|a| a == "--no-joint");
+    let pos = args.iter().filter(|a| a.as_str() != "--no-joint").cloned().collect();
+    (pos, joint)
+}
 
 struct Counting;
 static CUR: AtomicUsize = AtomicUsize::new(0);
@@ -437,9 +446,9 @@ fn audio_secs(s: &Stats) -> f64 {
     s.tracks.iter().map(secs).sum()
 }
 
-fn cmd_encode(ins: &[String], out: &str) -> Result<(), String> {
+fn cmd_encode(ins: &[String], out: &str, joint: bool) -> Result<(), String> {
     let inputs = read_inputs(ins)?;
-    let (r, m) = measure(|| encode(&inputs));
+    let (r, m) = measure(|| encode_opts(&inputs, joint));
     let (bytes, stats) = r?;
     write_new(Path::new(out), &bytes)?;
     print_stats(&stats);
@@ -474,9 +483,9 @@ fn cmd_decode(input: &str, dir: Option<&str>, fmt: PcmOut, only: Option<Vec<Stri
     Ok(())
 }
 
-fn cmd_bench(ins: &[String]) -> Result<(), String> {
+fn cmd_bench(ins: &[String], joint: bool) -> Result<(), String> {
     let inputs = read_inputs(ins)?;
-    let (r, em) = measure(|| encode(&inputs));
+    let (r, em) = measure(|| encode_opts(&inputs, joint));
     let (bytes, stats) = r?;
     let (r, dm) = measure(|| decode(&bytes, PcmOut::Flac));
     let outs = r?;
@@ -573,12 +582,21 @@ fn decode_opts(a: &[String]) -> Result<(Option<&str>, PcmOut, Option<Vec<String>
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let r = match (a.first().map(String::as_str), a.len()) {
-        (Some("encode"), n) if n >= 3 => cmd_encode(&a[1..n - 1], &a[n - 1]),
+        (Some("encode"), n) if n >= 3 => match positional(&a[1..]) {
+            (pos, joint) if pos.len() >= 2 => {
+                let (ins, out) = pos.split_at(pos.len() - 1);
+                cmd_encode(ins, &out[0], joint)
+            }
+            _ => Err(USAGE.into()),
+        },
         (Some("decode"), n) if n >= 2 => match decode_opts(&a) {
             Ok((dir, fmt, only)) => cmd_decode(&a[1], dir, fmt, only),
             Err(e) => Err(e),
         },
-        (Some("bench"), n) if n >= 2 => cmd_bench(&a[1..]),
+        (Some("bench"), n) if n >= 2 => match positional(&a[1..]) {
+            (pos, joint) if !pos.is_empty() => cmd_bench(&pos, joint),
+            _ => Err(USAGE.into()),
+        },
         _ => Err(USAGE.into()),
     };
     if let Err(e) = r {

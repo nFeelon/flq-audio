@@ -2,6 +2,7 @@
 
 # FLQ — Filon Lossless Quality
 
+[![ci](https://github.com/nFeelon/flq-audio/actions/workflows/ci.yml/badge.svg)](https://github.com/nFeelon/flq-audio/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![status](https://img.shields.io/badge/status-experimental-orange.svg)
 ![rust](https://img.shields.io/badge/rust-edition_2024-red.svg)
@@ -20,6 +21,19 @@ of encoding the block independently.
 | **Sample-exact** | FLAC/ALAC tracks decode to identical PCM samples; supported metadata is preserved where representable; the file itself is re-encoded |
 | **Adaptive** | coding method is chosen per block; anything not beneficial falls back to plain storage |
 
+**Benchmark headline.** On a common 47-file subset accepted by every
+compared tool, FLQ produced 50.5% of the source size, compared with
+51.2% for FLAC -8 and 52.0% for WavPack -hx.
+
+FLQ produced smaller files on 44/47 inputs than FLAC and 36/47 than
+WavPack. TAK and OptimFROG achieved smaller aggregate output sizes.
+
+These results compare compression ratio, not overall performance: FLQ
+encoding was approximately 4–80× slower than the reference codecs in
+the tested configurations.
+
+[Full comparison and methodology](#vs-reference-codecs).
+
 ## Quick start
 
 ```console
@@ -34,8 +48,10 @@ Requires Rust 1.85+ (edition 2024). The release binary lands at
 
 Accepted inputs: `.wav` `.aiff/.aif/.aifc` `.flac` `.mp3` `.m4a/.mp4`
 (ALAC or AAC) `.aac` `.ogg` (Vorbis/Opus). Up to 255 tracks per file.
-No codec-tuning flags — encoding decisions are adaptive; `decode` adds only
-`--format flac|wav` for FLAC/ALAC tracks and `--only` for subset extraction.
+No codec-tuning flags — encoding decisions are adaptive; `encode`/`bench`
+take `--no-joint` to skip reference analysis (used for the ablation below);
+`decode` adds only `--format flac|wav` for FLAC/ALAC tracks and `--only`
+for subset extraction.
 
 ## What each format becomes
 
@@ -50,9 +66,10 @@ No codec-tuning flags — encoding decisions are adaptive; `decode` adds only
 
 Per block and per track the encoder rejects any representation that isn't
 smaller than its alternatives — so no track pays for an encoding that didn't
-help. The container itself adds ~tens of bytes of metadata per track, so a
-bundle of unrelated, already-incompressible files can end up a few bytes
-larger than the inputs.
+help. The container adds only a small deflated metadata record per track
+(measured ~30 KB total across a 668 MiB / 47-file set), so a bundle of
+unrelated, already-incompressible files can end up slightly larger than
+the inputs.
 
 ## How it works
 
@@ -128,7 +145,7 @@ Dated reports: [`testdata/results/`](testdata/results/).
 | WAV int / float | 54.6% / 53.2% of source |
 | MP3 MPEG-1 L3 (modeled, 59 files) | 84.3% avg / 83.6% median / 76.3% best |
 | FLAC → PCM | ~98% (near parity with FLAC) |
-| AAC / Ogg / stored raw | 100% (+ tens of bytes meta) |
+| AAC / Ogg / stored raw | ≈100% payload size, plus container metadata |
 
 Bundling related files adds further savings on top of single-file packing.
 Groups below are freesound.org **author packs** — files uploaded by one
@@ -152,6 +169,73 @@ Encode  wall 0.490 s   peak heap 46.2 MiB   speed 12.2x realtime
 Decode  wall 0.026 s   peak heap 14.3 MiB   speed 231.7x realtime
 Accuracy: both tracks bit-exact
 ```
+
+### vs reference codecs
+
+Same corpus, same files, single-file encode, verified decode. On the
+47-file subset every tool accepted (identical inputs):
+
+| Codec | Output, % of source |
+|---|---|
+| OptimFROG extranew-light | 48.4% |
+| TAK -p4m | 49.9% |
+| **FLQ** | **50.5%** |
+| Monkey's Audio -c4000 | 50.9% |
+| FLAC -8 | 51.2% |
+| WavPack -hx | 52.0% |
+| 7-Zip LZMA2 -mx9 | 64.6% |
+| Zstd --ultra -22 | 78.1% |
+
+![FLQ vs reference codecs — output size on identical inputs](docs/assets/vs-reference-codecs.svg)
+
+Aggregate percentages hide the per-file picture, so here are the
+pairwise counts — a "win" means FLQ's file is smaller on that input:
+
+| FLQ vs | wins /47 | losses | median delta |
+|---|---|---|---|
+| FLAC | 44 | 3 | +0.66 pp |
+| WavPack | 36 | 11 | +1.09 pp |
+| Monkey's Audio | 24 | 23 | +0.01 pp |
+| TAK | 9 | 38 | −0.55 pp |
+| OptimFROG | 5 | 42 | −1.59 pp |
+| 7-Zip | 41 | 6 | +14.26 pp |
+| Zstd | 44 | 3 | +25.86 pp |
+
+Delta = reference codec size (% of source) − FLQ size (% of source).
+Positive values mean FLQ produced smaller files.
+
+The FLAC and WavPack leads are consistent across files; APE is a
+near-tie in per-file results on this subset (24 wins, 23 losses;
++0.01 pp median difference); OptimFROG and TAK stay ahead.
+
+#### ablation: which stage earns it
+
+`flq encode --no-joint` skips reference analysis entirely, and the
+encoder stats expose each pipeline stage. Payload bytes, same 47 files:
+
+| Pipeline stage | % of source | per-file vs FLAC |
+|---|---|---|
+| per-channel LPC/Rice | 50.95% | 32 win / 15 loss |
+| + stereo decorrelation | 50.77% | — |
+| + self/cross references (full FLQ) | 50.51% | 44 win / 3 loss |
+
+So the LPC/Rice core alone is already at/below FLAC's file-level size;
+stereo modes and references add ~0.4 pp on single unrelated files
+(references earn much more on related multi-track bundles — see the
+bundle chart above). This is a codec comparison, not a container trick:
+non-audio bytes per output are 30,454 B for FLQ (0.004%) vs 402,798 B
+for FLAC (0.06%) and 1,002,926 B for WavPack (0.14%), summed over the
+same files.
+
+Its edge is coverage: FLAC rejected 69/148 corpus files (float WAV,
+AIFF, odd headers), OptimFROG 69, TAK 94, while FLQ, WavPack and APE
+took all 148 — plus joint cross-track coding none of the reference
+codecs have. The honest cost: encode is ~4–80× slower than the
+reference codecs (the joint analysis pass is ~2/3 of that — 458 s vs
+153 s for the subset); decode stays fast (~0.2 s/file). PAQ8PX is the
+theoretical extreme, not a practical one (~61% at ~2,000× FLAC's encode
+time). Full method, settings, per-format tables and the ablation:
+[`2026-10-22_e254a5b.md`](testdata/results/2026-10-22_e254a5b.md)
 
 ## Modules
 
@@ -191,7 +275,7 @@ the current write format. Benchmarks above were measured at commits
 ## Development
 
 ```console
-cargo test --release                # 97 tests
+cargo test --release                # 98 tests
 cargo test --release -- --ignored   # + real-file fixture tests (testdata/)
 cargo clippy --release --all-targets
 ```

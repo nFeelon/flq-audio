@@ -372,6 +372,12 @@ fn mp3_track(inp: &Input, carry: &mut Option<mp3::model::M>) -> TrackData {
 }
 
 pub fn encode(inputs: &[Input]) -> Result<(Vec<u8>, Stats), String> {
+    encode_opts(inputs, true)
+}
+
+/// `joint = false` skips reference analysis entirely: PCM tracks are coded
+/// with LPC/Rice only (no self or cross references).
+pub fn encode_opts(inputs: &[Input], joint: bool) -> Result<(Vec<u8>, Stats), String> {
     if inputs.is_empty() || inputs.len() > 255 {
         return Err("expected 1..=255 inputs".into());
     }
@@ -485,13 +491,18 @@ pub fn encode(inputs: &[Input]) -> Result<(Vec<u8>, Stats), String> {
         match &tracks[k] {
             TrackData::Mp3(m) => {
                 reasons[k] = m.reason.clone();
-                continue;
             }
             TrackData::Raw(r) => {
                 reasons[k] = r.reason.clone();
-                continue;
             }
             TrackData::Pcm(_) => {}
+        }
+    }
+    for k in 0..n {
+        let TrackData::Pcm(_) = &tracks[k] else { continue };
+        if !joint {
+            reasons[k] = "joint disabled (--no-joint)".into();
+            continue;
         }
         let t = pcm_of(&tracks, k).unwrap();
         let mut ncc = 0f64;
@@ -1871,6 +1882,32 @@ pub(crate) mod tests {
             t1.final_bits,
             c_alone
         );
+    }
+
+    #[test]
+    fn no_joint_skips_self_refs() {
+        // a.wav whose second half replays the first half: self-ref blocks
+        // appear with joint analysis on, vanish with --no-joint.
+        let rate = 44100;
+        let sig = stereo(3, rate, 40_000);
+        let mut half = sig.clone();
+        for c in half.iter_mut() {
+            let (a, b) = c.split_at_mut(20_000);
+            b.copy_from_slice(a);
+        }
+        let wav = int_wav(1, 2, rate, 16, &half);
+        let inputs = [input("a.wav", wav)];
+        let (bytes, stats) = encode_opts(&inputs, true).unwrap();
+        assert!(stats.tracks[0].self_ref_blocks > 0, "expected self-refs");
+        let (bytes_nj, stats_nj) = encode_opts(&inputs, false).unwrap();
+        let t = &stats_nj.tracks[0];
+        assert_eq!(t.self_ref_blocks, 0);
+        assert_eq!(t.cross_ref_blocks, 0);
+        assert!(!t.joint);
+        assert_eq!(t.final_bits, t.stereo_bits);
+        let outs = decode(&bytes_nj, PcmOut::Flac).unwrap();
+        assert_eq!(outs[0].bytes, inputs[0].bytes, "no-joint decode must be byte-exact");
+        assert!(decode(&bytes, PcmOut::Flac).is_ok());
     }
 
     #[test]
