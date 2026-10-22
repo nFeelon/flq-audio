@@ -126,7 +126,7 @@ fn tukey(n: usize) -> Vec<f64> {
 // they cover only the domains used below.
 
 /// sin(x) for x in [0, π/4]; Taylor, residual < (π/4)^17/17! ≈ 5e-17.
-fn dsin(x: f64) -> f64 {
+pub(crate) fn dsin(x: f64) -> f64 {
     let z = x * x;
     x * (1.0
         + z * (-1.0 / 6.0
@@ -138,7 +138,7 @@ fn dsin(x: f64) -> f64 {
 }
 
 /// cos(x) for x in [0, π]; residual < (π/4)^18/18! ≈ 2e-18.
-fn dcos(x: f64) -> f64 {
+pub(crate) fn dcos(x: f64) -> f64 {
     let x = x.clamp(0.0, std::f64::consts::PI);
     if x > std::f64::consts::FRAC_PI_2 {
         return -dcos(std::f64::consts::PI - x);

@@ -2,6 +2,7 @@ use super::dec::{Reader, Samples, frames_sequential, samples_to_pcm};
 use super::enc::{V1Input, V1Opts, encode};
 use super::*;
 use crate::bits::crc32;
+use crate::codec::{dcos, dsin};
 use crate::formats;
 use crate::wav::tests::{fmt_chunk, riff};
 use std::io::Cursor;
@@ -813,6 +814,29 @@ struct VSpec {
     opts: V1Opts,
 }
 
+/// Platform-independent sin/cos for generated signals: committed vector
+/// inputs must be bit-identical on every OS, so libm is off-limits here.
+/// Range reduction via rem_euclid (fmod chain) is exact IEEE arithmetic.
+fn tsin(x: f64) -> f64 {
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
+    let r = x.rem_euclid(TAU);
+    let (q, s) = match r {
+        r if r <= FRAC_PI_2 => (r, 1.0),
+        r if r <= PI => (PI - r, 1.0),
+        r if r <= 3.0 * FRAC_PI_2 => (r - PI, -1.0),
+        r => (TAU - r, -1.0),
+    };
+    s * if q <= FRAC_PI_4 {
+        dsin(q)
+    } else {
+        dcos(FRAC_PI_2 - q)
+    }
+}
+
+fn tcos(x: f64) -> f64 {
+    tsin(std::f64::consts::FRAC_PI_2 - x)
+}
+
 /// Smooth deterministic tone: compressible, exercises LPC + warm-up.
 fn tone(ch: usize, bits: u16, frames: usize, seed: u64) -> Vec<Vec<i64>> {
     let half = 1i64 << (bits - 1);
@@ -822,8 +846,8 @@ fn tone(ch: usize, bits: u16, frames: usize, seed: u64) -> Vec<Vec<i64>> {
             (0..frames)
                 .map(|i| {
                     let f = i as f64;
-                    let v = amp * (0.013 * f + c as f64 * 0.7).sin()
-                        + amp * 0.4 * (0.031 * f + seed as f64).cos()
+                    let v = amp * tsin(0.013 * f + c as f64 * 0.7)
+                        + amp * 0.4 * tcos(0.031 * f + seed as f64)
                         + ((i * 37 + c * 11) % 97) as f64 * half as f64 * 1e-4;
                     v.round().clamp(-(half as f64), half as f64 - 1.0) as i64
                 })
@@ -850,8 +874,8 @@ fn ftone(ch: usize, frames: usize, f32_exact: bool) -> Vec<Vec<u64>> {
             (0..frames)
                 .map(|i| {
                     let f = i as f64;
-                    let v = 0.5 * (0.013 * f + c as f64).sin()
-                        + 0.2 * (0.031 * f).cos()
+                    let v = 0.5 * tsin(0.013 * f + c as f64)
+                        + 0.2 * tcos(0.031 * f)
                         + ((i * 37 + c * 11) % 97) as f64 * 1e-5;
                     if f32_exact {
                         f64::from(v as f32).to_bits()
@@ -869,10 +893,10 @@ fn ftone32(ch: usize, frames: usize) -> Vec<Vec<u64>> {
         .map(|c| {
             (0..frames)
                 .map(|i| {
-                    let f = i as f32;
-                    (0.5f32 * (0.013 * f + c as f32).sin()
-                        + 0.2 * (0.031 * f).cos()
-                        + ((i * 37 + c * 11) % 97) as f32 * 1e-5)
+                    let f = i as f64;
+                    ((0.5 * tsin(0.013 * f + c as f64)
+                        + 0.2 * tcos(0.031 * f)
+                        + ((i * 37 + c * 11) % 97) as f64 * 1e-5) as f32)
                         .to_bits() as u64
                 })
                 .collect()
