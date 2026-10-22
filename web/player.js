@@ -3,7 +3,7 @@
 
 const CHUNK_SEC = 2;       // playback decode chunk per track
 const AHEAD_SEC = 4;       // schedule this far ahead of the play head
-const SCAN_SEC = 1;        // waveform scan slice length
+const SCAN_SEC = 2;        // waveform scan slice length
 const PEAK_COLS = 1200;    // max waveform columns kept per track
 const ORIGIN = ['WAV', 'AIFF', 'FLAC', 'ALAC'];
 const ICO_VOL = '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>';
@@ -44,7 +44,7 @@ const P = {
   ch: [],               // per track {gain, ana, vol, enabled, solo, level, peak}
   sources: new Set(),
   playing: false, loop: false, posSec: 0, schedSec: 0, startAt: 0, timer: 0,
-  focus: 0, scanGen: 0, scanning: false,
+  focus: 0, scanGen: 0, scanning: false, seekT: 0, seekResume: false,
   decSec: 0, decWall: 0, // decode-speed accumulators
   peaks: [],            // per track {a: Float32Array, filled: int, cols: int}
 };
@@ -119,6 +119,7 @@ function pump() {
 
 function setPlaying(on) {
   if (!P.h || !P.ctx) return;
+  P.seekResume = false;
   if (on) {
     if (P.ctx.state === 'suspended') P.ctx.resume();
     if (P.posSec >= fileDur()) P.posSec = 0;
@@ -150,11 +151,28 @@ function playPos() {
 }
 
 function seekTo(frac) {
-  const was = P.playing;
-  if (was) setPlaying(false);
-  P.posSec = clamp(frac, 0, 1) * fileDur();
-  if (was) setPlaying(true);
-  else { drawTransport(); drawWave(); }
+  P.posSec = Math.min(clamp(frac, 0, 1) * fileDur(), fileDur());
+  if (P.playing) {
+    // park the stream; restart decoding once the seek settles (scrub-safe:
+    // a drag fires one seek per mousemove and each restart is a sync decode burst)
+    P.playing = false;
+    stopScheduled();
+    P.ctx.suspend();
+    setPlayIcon(false);
+    P.seekResume = true;
+  }
+  drawTransport();
+  drawWave();
+  if (P.seekResume) {
+    clearTimeout(P.seekT);
+    P.seekT = setTimeout(() => {
+      P.seekT = 0;
+      if (P.seekResume) {
+        P.seekResume = false;
+        setPlaying(true);
+      }
+    }, 120);
+  }
 }
 
 function skip(ds) { seekTo((playPos() + ds) / Math.max(fileDur(), 1e-9)); }
@@ -178,7 +196,7 @@ function openFile(bytes, label) {
   P.ch = [];
   if (P.h) wasm.flq_close(P.h);
   Object.assign(P, {
-    h: 0, posSec: 0, schedSec: 0, decSec: 0, decWall: 0,
+    h: 0, posSec: 0, schedSec: 0, decSec: 0, decWall: 0, seekResume: false,
     sources: new Set(), fileName: label, fileBytes: bytes.length, focus: 0,
   });
   $('err').hidden = true;
@@ -244,7 +262,7 @@ async function startScan() {
       pk.filled = c1;
       s += len;
       drawLayerWave(ti);
-      if (ti === P.focus) drawWave();
+      if (ti === P.focus && $('pane-wave').classList.contains('on')) drawWave();
       statusLeft();
       await new Promise((r) => setTimeout(r, 0)); // let playback/timers interleave
     }
