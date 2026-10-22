@@ -144,32 +144,43 @@ fn json_escape(s: &str) -> String {
 }
 
 /// Write track metadata JSON into the out buffer:
-/// {"frame_len":..,"tracks":[{"name","origin","rate","channels",
-/// "channel_mask","sample_fmt","bits","frames"}]}
-/// Returns 1 on success, 0 on error.
+/// {"version":1,"frame_len":..,"has_index":bool,"tracks":[{"name","origin",
+/// "rate","channels","channel_mask","sample_fmt","bits","frames","nframes",
+/// "coded","pcm_crc","tags_len"}]}
+/// `coded` is the track's total frame-record bytes (headers + payloads +
+/// crcs). Returns 1 on success, 0 on error.
 #[no_mangle]
 pub extern "C" fn flq_info_json(h: u32) -> u32 {
     let r = with_reader(h, |rd| {
-        let tracks = rd
-            .tracks()
-            .iter()
-            .map(|m| {
-                format!(
-                    "{{\"name\":\"{}\",\"origin\":{},\"rate\":{},\"channels\":{},\
-                     \"channel_mask\":{},\"sample_fmt\":{},\"bits\":{},\"frames\":{}}}",
-                    json_escape(&m.name),
-                    m.origin,
-                    m.rate,
-                    m.channels,
-                    m.channel_mask,
-                    m.sample_fmt,
-                    m.bits,
-                    m.frames
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        Ok(format!("{{\"frame_len\":{},\"tracks\":[{}]}}", rd.frame_len(), tracks))
+        let metas = rd.tracks().to_vec();
+        let mut tracks = Vec::with_capacity(metas.len());
+        for (t, m) in metas.iter().enumerate() {
+            let coded = rd.coded_bytes(t)?;
+            tracks.push(format!(
+                "{{\"name\":\"{}\",\"origin\":{},\"rate\":{},\"channels\":{},\
+                 \"channel_mask\":{},\"sample_fmt\":{},\"bits\":{},\"frames\":{},\
+                 \"nframes\":{},\"coded\":{},\"pcm_crc\":{},\"tags_len\":{}}}",
+                json_escape(&m.name),
+                m.origin,
+                m.rate,
+                m.channels,
+                m.channel_mask,
+                m.sample_fmt,
+                m.bits,
+                m.frames,
+                m.nframes,
+                coded,
+                m.pcm_crc,
+                m.tags.len()
+            ));
+        }
+        Ok(format!(
+            "{{\"version\":{},\"frame_len\":{},\"has_index\":{},\"tracks\":[{}]}}",
+            flq::v1::VERSION,
+            rd.frame_len(),
+            rd.has_index(),
+            tracks.join(",")
+        ))
     });
     match r {
         Some(j) => {

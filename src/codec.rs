@@ -108,14 +108,81 @@ fn tukey(n: usize) -> Vec<f64> {
         .map(|i| {
             let i = i as f64;
             if i < t {
-                0.5 * (1.0 - (std::f64::consts::PI * i / t).cos())
+                0.5 * (1.0 - dcos(std::f64::consts::PI * i / t))
             } else if i > last - t {
-                0.5 * (1.0 - (std::f64::consts::PI * (last - i) / t).cos())
+                0.5 * (1.0 - dcos(std::f64::consts::PI * (last - i) / t))
             } else {
                 1.0
             }
         })
         .collect()
+}
+
+// Bit-portable f64 math for encoder decisions: platform libm (UCRT vs
+// glibc vs musl vs wasm) differs by ULPs, and encoder output must be
+// byte-identical everywhere — conformance vectors are re-encoded on CI.
+// IEEE basic ops are correctly rounded, so a fixed-order evaluation is
+// bit-identical on every target. These are NOT a libm replacement —
+// they cover only the domains used below.
+
+/// sin(x) for x in [0, π/4]; Taylor, residual < (π/4)^17/17! ≈ 5e-17.
+fn dsin(x: f64) -> f64 {
+    let z = x * x;
+    x * (1.0
+        + z * (-1.0 / 6.0
+            + z * (1.0 / 120.0
+                + z * (-1.0 / 5040.0
+                    + z * (1.0 / 362880.0
+                        + z * (-1.0 / 39916800.0
+                            + z * (1.0 / 6227020800.0 + z * (-1.0 / 1307674368000.0))))))))
+}
+
+/// cos(x) for x in [0, π]; residual < (π/4)^18/18! ≈ 2e-18.
+fn dcos(x: f64) -> f64 {
+    let x = x.clamp(0.0, std::f64::consts::PI);
+    if x > std::f64::consts::FRAC_PI_2 {
+        return -dcos(std::f64::consts::PI - x);
+    }
+    if x > std::f64::consts::FRAC_PI_4 {
+        return dsin(std::f64::consts::FRAC_PI_2 - x);
+    }
+    let z = x * x;
+    1.0 + z
+        * (-0.5
+            + z * (1.0 / 24.0
+                + z * (-1.0 / 720.0
+                    + z * (1.0 / 40320.0
+                        + z * (-1.0 / 3628800.0
+                            + z * (1.0 / 479001600.0
+                                + z * (-1.0 / 87178291200.0 + z * (1.0 / 20922789888000.0))))))))
+}
+
+/// floor(log2(x)) for finite x > 0, via the exponent field.
+fn floor_log2(x: f64) -> i32 {
+    debug_assert!(x > 0.0 && x.is_finite());
+    let mut v = x;
+    let mut adj = 0i32;
+    if v.to_bits() >> 52 == 0 {
+        v *= 4503599627370496.0; // subnormal -> normal: x * 2^52
+        adj = 52;
+    }
+    ((v.to_bits() >> 52) & 0x7ff) as i32 - 1023 - adj
+}
+
+/// log2(x) for finite x >= 1: e + log2(mantissa in [1,2)) via the
+/// atanh series 2·Σ s^(2k+1)/(2k+1), s = (m-1)/(m+1) in [0, 1/3).
+fn dlog2(x: f64) -> f64 {
+    debug_assert!(x >= 1.0 && x.is_finite());
+    let b = x.to_bits();
+    let e = ((b >> 52) & 0x7ff) as i32 - 1023;
+    let m = f64::from_bits((b & !(0x7ffu64 << 52)) | (1023u64 << 52));
+    let s = (m - 1.0) / (m + 1.0);
+    let z = s * s;
+    let mut sum = 0.0;
+    for k in (0..24u32).rev() {
+        sum = sum * z + 1.0 / (2 * k + 1) as f64;
+    }
+    e as f64 + 2.0 * s * sum * std::f64::consts::LOG2_E
 }
 
 fn autocorr(sig: &[i64], win: &[f64]) -> [f64; MAX_ORDER + 1] {
@@ -212,7 +279,7 @@ fn quantize(a: &[f64]) -> Option<(u8, Vec<i16>)> {
     if !cmax.is_finite() || cmax == 0.0 {
         return None;
     }
-    let ex = cmax.log2().floor() as i32 + 1;
+    let ex = floor_log2(cmax) + 1;
     let qshift = (14 - ex).clamp(0, 31) as u8;
     let scale = 2f64.powi(i32::from(qshift));
     let q: Vec<i16> = a
@@ -406,7 +473,7 @@ fn plan_signal_win(w: &[i64], n: usize, preset: u8, win: &[f64], warm: bool) -> 
             } else {
                 0.0
             };
-            let proxy = n as f64 * (mean + 1.0).log2()
+            let proxy = n as f64 * dlog2(mean + 1.0)
                 + o as f64 * f64::from(LPC_PREC)
                 + o as f64 * wbits_est as f64;
             ranked.push((proxy, o, qshift, q));
@@ -1196,6 +1263,29 @@ pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore
 mod tests {
     use super::*;
     use crate::bits::{BitReader as BR, BitWriter as BW, bit_len};
+
+    #[test]
+    fn portable_math_close_to_libm() {
+        for i in 0..=1000 {
+            let x = std::f64::consts::PI * i as f64 / 1000.0;
+            assert!((dcos(x) - x.cos()).abs() < 1e-15, "dcos({x})");
+        }
+        for i in 1..=1000 {
+            let x = i as f64 / 7.3;
+            assert!((dlog2(x) - x.log2()).abs() < 1e-12, "dlog2({x})");
+        }
+        for (x, want) in [
+            (f64::MIN_POSITIVE, -1022),
+            (f64::from_bits(1), -1074),
+            (0.5, -1),
+            (1.0, 0),
+            (7.999, 2),
+            (8.0, 3),
+            (1024.0, 10),
+        ] {
+            assert_eq!(floor_log2(x), want, "floor_log2({x})");
+        }
+    }
 
     fn float_roundtrip(words: &[u64], mw: u8, pcm_bits: u16) -> Vec<u64> {
         let fd = split_float(&[words.to_vec()], mw);

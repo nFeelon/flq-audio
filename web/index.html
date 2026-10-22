@@ -3,38 +3,80 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>flq player</title>
+<title>FLQ player</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main>
-  <h1>flq player</h1>
-  <p class="sub">FLQ lossless audio in the browser — decode happens locally in WebAssembly.</p>
+<div id="drop-overlay" hidden><div>Drop a <b>.flq</b> file to open</div></div>
 
-  <div id="drop">
-    <p>Drop a <code>.flq</code> file here or</p>
-    <input type="file" id="file" accept=".flq">
-    <button id="sample">load sample</button>
+<main>
+  <div id="empty">
+    <div class="e-brand"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg> FLQ <span class="dim">player</span></div>
+    <div class="e-sub dim">lossless audio in the browser — decode is local WebAssembly</div>
+    <div id="empty-drop" role="button" tabindex="0">
+      <div class="e-cta">Drop a .flq file here</div>
+      <div class="dim">or click to browse</div>
+    </div>
+    <div class="e-btns">
+      <button id="empty-demo" class="btn ghost">load bundled demo</button>
+      <button id="empty-stems" class="btn ghost">load stems (8 tracks)</button>
+    </div>
   </div>
 
-  <div id="err" hidden></div>
-
-  <section id="player" hidden>
-    <div id="meta"></div>
-    <table id="tracks">
-      <thead><tr>
-        <th></th><th>track</th><th>format</th><th>rate</th><th>ch</th><th>duration</th><th>pcm</th><th></th><th>mute</th><th>solo</th>
-      </tr></thead>
-      <tbody></tbody>
-    </table>
-    <div id="ratio"></div>
-    <div id="transport">
-      <button id="play">play</button>
-      <span id="time">0:00 / 0:00</span>
-      <input type="range" id="seek" min="0" max="1000" value="0">
+  <header id="now" hidden>
+    <canvas id="thumb" width="56" height="56" aria-hidden="true"></canvas>
+    <div class="now-meta">
+      <div id="now-name">no file loaded</div>
+      <div id="now-sub" class="dim">drop a .flq anywhere on this page</div>
     </div>
+    <div class="grow"></div>
+    <button id="open" class="btn primary">Open file</button>
+    <button id="sample" class="btn ghost">demo</button>
+    <button id="stems" class="btn ghost">stems</button>
+    <input type="file" id="file" accept=".flq" hidden>
+  </header>
+
+  <div id="transport" hidden>
+    <button id="back" class="cbtn" title="back 10 s" aria-label="back 10 seconds"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M19 20 9 12l10-8v16Z"/><path d="M5 5v14"/></svg></button>
+    <button id="play" class="cbtn big" title="play/pause (space)" aria-label="play or pause"><svg class="ic i-play" viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M6 4l14 8-14 8V4Z"/></svg><svg class="ic i-pause" viewBox="0 0 24 24" aria-hidden="true" hidden><rect class="solid" x="6" y="4" width="4" height="16" rx="1"/><rect class="solid" x="14" y="4" width="4" height="16" rx="1"/></svg></button>
+    <button id="fwd" class="cbtn" title="forward 10 s" aria-label="forward 10 seconds"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M5 4l10 8-10 8V4Z"/><path d="M19 5v14"/></svg></button>
+    <button id="loop" class="cbtn tog" title="loop" aria-label="loop" aria-pressed="false"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg></button>
+    <span id="t-pos" class="t">0:00</span>
+    <input type="range" id="seek" min="0" max="1000" value="0" aria-label="seek">
+    <span id="t-dur" class="t">0:00</span>
+    <span class="vol" title="master volume"><svg class="ic dim" viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>
+      <input type="range" id="volume" min="0" max="100" value="100" aria-label="volume">
+    </span>
+    <canvas id="cl-scope" width="180" height="40" aria-hidden="true"></canvas>
+    <div class="meter" title="focused layer peak level">
+      <div id="rt-level" aria-hidden="true"></div><span id="rt-db">−∞ dB</span>
+    </div>
+  </div>
+
+  <div id="chips" hidden></div>
+
+  <nav id="tabs" role="tablist" aria-label="views" hidden>
+    <button class="tab on" data-tab="layers" role="tab" aria-selected="true">Layers</button>
+    <button class="tab" data-tab="wave" role="tab" aria-selected="false">Waveform</button>
+    <button class="tab" data-tab="info" role="tab" aria-selected="false">Info</button>
+  </nav>
+
+  <section id="pane-layers" class="pane on" role="tabpanel"><div id="layers"></div></section>
+
+  <section id="pane-wave" class="pane" role="tabpanel">
+    <div class="wave-head"><span id="wave-name" class="dim">—</span><span class="dim hint">click / drag to seek</span></div>
+    <canvas id="wave" height="200" role="img" aria-label="track waveform overview, drag to seek"></canvas>
   </section>
+
+  <section id="pane-info" class="pane" role="tabpanel"><div id="info-grid"></div></section>
 </main>
+
+<footer id="statusbar">
+  <span id="sb-left">idle</span>
+  <span id="sb-right"></span>
+</footer>
+
+<div id="err" hidden></div>
 <script src="player.js"></script>
 </body>
 </html>

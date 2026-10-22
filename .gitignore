@@ -34,3 +34,4 @@ fuzz/artifacts/
 # wasm build output (CI builds it into Pages)
 web/flq_wasm.wasm
 wasm/target/
+.windsurf/

@@ -1086,8 +1086,10 @@ fn v1_vectors_conform() {
     assert_eq!(n, vector_specs().len(), "manifest/spec count mismatch");
 }
 
-/// Deterministic 2-track demo for the web player: "drums.wav" (kick/hat
-/// pattern, mono) + "pad.wav" (Am chord, stereo), ~14 s at 44.1 kHz.
+/// Deterministic demos for the web player: "drums.wav" (kick/hat
+/// pattern, mono) + "pad.wav" (Am chord, stereo), ~14 s at 44.1 kHz —
+/// and "stems.flq", an 8-track session bundle (~16 s) with one f32
+/// track, showing off multi-track access and tonal compression.
 /// `cargo test --release -- --ignored gen_web_demo`
 #[test]
 #[ignore]
@@ -1177,4 +1179,248 @@ fn gen_web_demo() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/samples");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("demo.flq"), &bytes).unwrap();
+
+    // ---------------- stems.flq: 8-track session bundle ----------------
+    // Am — F — C — G, 4 s per chord, 120 bpm (beat = 0.5 s). Mostly
+    // sustained tones: LTP + LPC shine, so the archive lands at a few %
+    // of the ~20 MB of raw PCM. Track 8 is f32 — float coverage demo.
+    let pi = std::f64::consts::PI;
+    let mut rng2 = 0x9E3779B97F4A7C15u64;
+    let mut next2 = || {
+        rng2 ^= rng2 << 13;
+        rng2 ^= rng2 >> 7;
+        rng2 ^= rng2 << 17;
+        ((rng2 >> 33) as i32) as f64 / i32::MAX as f64
+    };
+    let n2 = rate * 16;
+    let chord = |i: usize| [55.0, 43.65, 65.41, 49.0][i / (rate * 4) % 4];
+    let triad = |i: usize| {
+        [
+            [220.0, 261.63, 329.63],
+            [174.61, 220.0, 261.63],
+            [130.81, 164.81, 196.0],
+            [196.0, 246.94, 293.66],
+        ][i / (rate * 4) % 4]
+    };
+
+    let kick: Vec<i64> = (0..n2)
+        .map(|i| {
+            let tb = (i % beat) as f64 / rate as f64; // seconds into the beat
+            let ph = 2.0 * pi * (48.0 * tb + 3.0 * (1.0 - (-30.0 * tb).exp()));
+            (ph.sin() * (-(tb / 0.20)).exp() * 30000.0) as i64
+        })
+        .collect();
+    let snare: Vec<i64> = (0..n2)
+        .map(|i| {
+            let sb = (i % beat) as f64 / rate as f64;
+            if (i / beat) % 2 == 1 && sb < 0.25 {
+                let noise = next2() * (-(sb / 0.09)).exp() * 0.5;
+                let tone = (2.0 * pi * 185.0 * sb).sin() * (-(sb / 0.12)).exp();
+                ((noise + tone) * 12000.0) as i64
+            } else {
+                0
+            }
+        })
+        .collect();
+    let hats: Vec<i64> = (0..n2)
+        .map(|i| {
+            let hb = (i % (beat / 2)) as f64 / rate as f64;
+            let dec = if (i / (beat / 2)) % 8 == 7 {
+                0.22
+            } else {
+                0.03
+            };
+            if hb < dec * 3.0 {
+                (next2() * (-(hb / dec)).exp() * 5500.0) as i64
+            } else {
+                0
+            }
+        })
+        .collect();
+    let bass: Vec<i64> = (0..n2)
+        .map(|i| {
+            let tbar = (i % (rate * 4)) as f64 / rate as f64;
+            let atk = (tbar / 0.02).min(1.0);
+            let r = chord(i);
+            let v =
+                (2.0 * pi * r * tbar).sin() * atk + 0.35 * (2.0 * pi * r * 2.0 * tbar).sin() * atk;
+            (v * 0.55 * 26000.0) as i64
+        })
+        .collect();
+    let chords: Vec<Vec<i64>> = (0..2)
+        .map(|c| {
+            (0..n2)
+                .map(|i| {
+                    let t = i as f64 / rate as f64;
+                    let tbar = (i % (rate * 4)) as f64 / rate as f64;
+                    let atk = (tbar / 0.30).min(1.0);
+                    let trem = 0.8 + 0.2 * (2.0 * pi * 0.5 * t).sin();
+                    let v: f64 = triad(i)
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &fq)| (2.0 * pi * (fq + c as f64 * 0.25) * t + k as f64).sin())
+                        .sum::<f64>()
+                        / 3.0;
+                    (v * trem * atk * 16000.0) as i64
+                })
+                .collect()
+        })
+        .collect();
+    const MEL: [f64; 16] = [
+        440.0, 523.25, 587.33, 659.26, 783.99, 659.26, 587.33, 523.25, 440.0, 587.33, 659.26,
+        783.99, 880.0, 783.99, 659.26, 587.33,
+    ];
+    let lead: Vec<Vec<i64>> = (0..2)
+        .map(|c| {
+            (0..n2)
+                .map(|i| {
+                    let nb = (i % (beat / 2)) as f64 / rate as f64; // 8th notes
+                    let vib = 1.0 + 0.004 * (2.0 * pi * 5.5 * i as f64 / rate as f64).sin();
+                    let env = (nb / 0.01).min(1.0) * ((0.20 - nb) / 0.05).clamp(0.0, 1.0);
+                    let v = (2.0 * pi * MEL[(i / (beat / 2)) % 16] * vib * nb).sin() * env;
+                    (v * (1.0 - c as f64 * 0.15) * 20000.0) as i64
+                })
+                .collect()
+        })
+        .collect();
+    let arp: Vec<Vec<i64>> = (0..2)
+        .map(|c| {
+            (0..n2)
+                .map(|i| {
+                    let st = i / (beat / 4); // 16th notes
+                    let ab = (i % (beat / 4)) as f64 / rate as f64;
+                    let f = triad(i)[st % 3] * if st % 2 == 1 { 2.0 } else { 1.0 };
+                    let env = (ab / 0.005).min(1.0) * (-(ab / 0.10)).exp();
+                    let v =
+                        ((2.0 * pi * f * ab).sin() + 0.3 * (2.0 * pi * 3.0 * f * ab).sin()) * env;
+                    let pan = if st % 2 == (c & 1) { 1.0 } else { 0.7 };
+                    (v * pan * 12000.0) as i64
+                })
+                .collect()
+        })
+        .collect();
+    let keys: Vec<Vec<u64>> = (0..2)
+        .map(|c| {
+            (0..n2)
+                .map(|i| {
+                    let t = i as f64 / rate as f64;
+                    let tbar = (i % (rate * 4)) as f64 / rate as f64;
+                    let atk = (tbar / 0.04).min(1.0);
+                    let trem = 0.85 + 0.15 * (2.0 * pi * 4.2 * t + c as f64).sin();
+                    let v: f64 = triad(i)
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &fq)| {
+                            (2.0 * pi * (fq * 2.0 + c as f64 * 0.4) * t + k as f64).sin()
+                                + 0.2 * (2.0 * pi * (fq * 4.0) * t).sin()
+                        })
+                        .sum::<f64>()
+                        / 3.0;
+                    ((v * trem * atk * 0.32) as f32).to_bits() as u64
+                })
+                .collect()
+        })
+        .collect();
+
+    let stems = [
+        (
+            "01_kick.wav",
+            mk_wav(
+                1,
+                1,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&[kick], 16, n2),
+            ),
+        ),
+        (
+            "02_snare.wav",
+            mk_wav(
+                1,
+                1,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&[snare], 16, n2),
+            ),
+        ),
+        (
+            "03_hats.wav",
+            mk_wav(
+                1,
+                1,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&[hats], 16, n2),
+            ),
+        ),
+        (
+            "04_bass.wav",
+            mk_wav(
+                1,
+                1,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&[bass], 16, n2),
+            ),
+        ),
+        (
+            "05_chords.wav",
+            mk_wav(
+                1,
+                2,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&chords, 16, n2),
+            ),
+        ),
+        (
+            "06_lead.wav",
+            mk_wav(
+                1,
+                2,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&lead, 16, n2),
+            ),
+        ),
+        (
+            "07_arp.wav",
+            mk_wav(
+                1,
+                2,
+                rate as u32,
+                16,
+                0,
+                crate::wav::ints_to_pcm(&arp, 16, n2),
+            ),
+        ),
+        (
+            "08_keys_f32.wav",
+            mk_wav(
+                3,
+                2,
+                rate as u32,
+                32,
+                0,
+                crate::wav::words_to_pcm(&keys, 32, n2),
+            ),
+        ),
+    ];
+    let bytes = enc(
+        &stems,
+        &V1Opts {
+            preset: 5,
+            threads: 1,
+            frame_len: 16384,
+            index: true,
+        },
+    );
+    std::fs::write(dir.join("stems.flq"), &bytes).unwrap();
+    eprintln!("stems.flq: {} B", bytes.len());
 }

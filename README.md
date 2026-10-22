@@ -43,7 +43,11 @@ Requires Rust 1.85+ (edition 2024). The release binary lands at
 `target/release/flq` — it is not added to PATH. Prebuilt binaries are
 attached to [GitHub releases](https://github.com/nFeelon/flq-audio/releases).
 Try it in the browser: [`web/`](web/) is a WASM player (mute/solo per
-stem, seek, WAV export) — see [`web/README.md`](web/README.md).
+stem, seek, WAV export) — see [`web/README.md`](web/README.md). The
+bundled 8-track **stems** demo is live at
+[nfeelon.github.io/flq-audio](https://nfeelon.github.io/flq-audio/):
+
+[![FLQ web player: stems.flq, 8 tracks in the Layers view](docs/assets/webplayer.png)](https://nfeelon.github.io/flq-audio/)
 
 Options. `encode`: `-0`/`-5`/`-8` (LPC search depth; default `-5`, within
 0.01 pp of exhaustive `-8`), `-j N` (threads; default all cores),

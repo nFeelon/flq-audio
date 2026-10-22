@@ -60,11 +60,16 @@ const demof = join(root, 'web/samples/demo.flq');
   const j = info(h);
   if (j.frame_len !== 16384 || j.tracks.length !== 1 || j.tracks[0].frames !== 16507)
     throw new Error(`bad info: ${JSON.stringify(j)}`);
+  const t0 = j.tracks[0];
+  if (j.version !== 1 || !j.has_index || t0.nframes !== 2 || !(t0.coded > 0) || typeof t0.tags_len !== 'number')
+    throw new Error(`bad info fields: ${JSON.stringify(j)}`);
   W.flq_close(h);
   const d = open(demof);
   const dj = info(d);
   if (dj.tracks.length !== 2 || dj.tracks[0].name !== 'drums.wav')
     throw new Error(`bad demo info: ${JSON.stringify(dj)}`);
+  if (dj.tracks.some((t) => !(t.coded > 0)))
+    throw new Error(`demo coded sizes missing: ${JSON.stringify(dj)}`);
   W.flq_close(d);
   console.log('info ok: vec 1x16507f, demo 2 tracks'); pass++;
 }
@@ -112,4 +117,19 @@ const demof = join(root, 'web/samples/demo.flq');
   console.log('demo: 2 tracks decode+wav ok'); pass++;
 }
 
-console.log(`smoke: ${pass}/3 checks passed`);
+// 5. stems bundle: 8 tracks incl. one f32, decode a second of each
+{
+  const h = open(join(root, 'web/samples/stems.flq'));
+  const j = info(h);
+  if (j.tracks.length !== 8) throw new Error(`stems tracks: ${j.tracks.length}`);
+  if (!j.tracks.some((t) => t.sample_fmt === 1)) throw new Error('stems: no f32 track');
+  for (let t = 0; t < j.tracks.length; t++) {
+    const g = decF32(h, t, 0, j.tracks[t].rate);
+    if (g.length !== j.tracks[t].rate * j.tracks[t].channels)
+      throw new Error(`stems track ${t} chunk len`);
+  }
+  W.flq_close(h);
+  console.log('stems: 8 tracks (incl. f32) decode ok'); pass++;
+}
+
+console.log(`smoke: ${pass}/4 checks passed`);
