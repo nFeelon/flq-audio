@@ -47,7 +47,7 @@ fn with_reader<R>(h: u32, f: impl FnOnce(&mut Rd) -> Result<R, String>) -> Optio
 // ------------------------------------------------------------ memory / errors
 
 /// Allocate `len` bytes in wasm memory for the caller to fill.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_alloc(len: u32) -> *mut u8 {
     let mut v = Vec::<u8>::with_capacity(len as usize);
     let p = v.as_mut_ptr();
@@ -59,31 +59,32 @@ pub extern "C" fn flq_alloc(len: u32) -> *mut u8 {
 ///
 /// # Safety
 /// `ptr`/`len` must come from a previous `flq_alloc` call, at most once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn flq_free(ptr: *mut u8, len: u32) {
     if !ptr.is_null() {
-        drop(Vec::from_raw_parts(ptr, 0, len as usize));
+        // SAFETY: caller contract — ptr/len came from `flq_alloc` once.
+        drop(unsafe { Vec::from_raw_parts(ptr, 0, len as usize) });
     }
 }
 
 /// Last error message bytes (UTF-8); empty when no error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_err_ptr() -> *const u8 {
     ERR.with(|e| e.borrow().as_ptr())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_err_len() -> u32 {
     ERR.with(|e| e.borrow().len() as u32)
 }
 
 /// Last output buffer bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_out_ptr() -> *const u8 {
     OUT.with(|o| o.borrow().as_ptr())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_out_len() -> u32 {
     OUT.with(|o| o.borrow().len() as u32)
 }
@@ -95,13 +96,14 @@ pub extern "C" fn flq_out_len() -> u32 {
 ///
 /// # Safety
 /// `ptr` must be valid for `len` bytes for the duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn flq_open(ptr: *const u8, len: u32) -> u32 {
     if ptr.is_null() || len == 0 {
         set_err("flq_open: null or empty input");
         return 0;
     }
-    let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+    // SAFETY: caller contract — ptr is valid for len bytes during the call.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
     match Reader::open(Cursor::new(bytes)) {
         Ok(rd) => READERS.with(|t| {
             let mut t = t.borrow_mut();
@@ -116,7 +118,7 @@ pub unsafe extern "C" fn flq_open(ptr: *const u8, len: u32) -> u32 {
 }
 
 /// Drop a reader handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_close(h: u32) {
     READERS.with(|t| {
         if let Some(slot) = t.borrow_mut().get_mut((h.wrapping_sub(1)) as usize) {
@@ -149,7 +151,7 @@ fn json_escape(s: &str) -> String {
 /// "coded","pcm_crc","tags_len"}]}
 /// `coded` is the track's total frame-record bytes (headers + payloads +
 /// crcs). Returns 1 on success, 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_info_json(h: u32) -> u32 {
     let r = with_reader(h, |rd| {
         let metas = rd.tracks().to_vec();
@@ -196,7 +198,7 @@ pub extern "C" fn flq_info_json(h: u32) -> u32 {
 /// `2^(bits-1)`; f32 words pass through; f64 words narrow to f32.
 /// `start` is a sample index passed as a JS number (f64), floored.
 /// Returns 1 on success, 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_decode_f32(h: u32, track: u32, start: f64, len: u32) -> u32 {
     let r = with_reader(h, |rd| {
         let t = track as usize;
@@ -244,7 +246,7 @@ pub extern "C" fn flq_decode_f32(h: u32, track: u32, start: f64, len: u32) -> u3
 
 /// Write the full track as WAV bytes (identical to `flq decode
 /// --format wav`) into the out buffer. Returns 1 on success, 0 on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn flq_wav(h: u32, track: u32) -> u32 {
     let r = with_reader(h, |rd| {
         let t = track as usize;

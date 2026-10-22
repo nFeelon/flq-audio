@@ -1,15 +1,19 @@
 //! External format handling: input sniffing, symphonia decode of FLAC/ALAC,
 //! FLAC metadata-block preservation, and FLAC output via flacenc.
 
+use std::collections::VecDeque;
 use std::io::Cursor;
+use std::sync::mpsc::Receiver;
 
 use symphonia::core::audio::{Audio, GenericAudioBufferRef};
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions, well_known};
+use symphonia::core::codecs::audio::{
+    AudioCodecId, AudioCodecParameters, AudioDecoder, AudioDecoderOptions, well_known,
+};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::{MetadataOptions, StandardTag, Tag, Visual};
 use symphonia::default::{get_codecs, get_probe};
 
@@ -59,12 +63,17 @@ fn adts_at(b: &[u8]) -> bool {
     b.len() >= 7 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0 && (b[2] >> 2) & 0xF != 0xF
 }
 
-/// Find a child atom inside `b`; returns its payload range.
-fn find_atom<'a>(b: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+/// ISO-BMFF atom walker: yields (fourcc, body) per top-level atom.
+/// `size` handles 0 (to EOF) and 1 (64-bit); bodies are clamped to the
+/// buffer so a truncated final atom is still visible.
+fn atoms(b: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
     let mut pos = 0usize;
-    while pos + 8 <= b.len() {
+    std::iter::from_fn(move || loop {
+        if pos + 8 > b.len() {
+            return None;
+        }
         let size = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as u64;
-        let id = &b[pos + 4..pos + 8];
+        let id: [u8; 4] = b[pos + 4..pos + 8].try_into().unwrap();
         let (hdr, body_len) = match size {
             0 => (8u64, (b.len() - pos) as u64 - 8),
             1 => {
@@ -77,16 +86,20 @@ fn find_atom<'a>(b: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
             s => (8, s.saturating_sub(8)),
         };
         let start = pos + hdr as usize;
-        if id == want {
-            return b.get(start..start.saturating_add(body_len as usize));
-        }
-        let next = pos.checked_add(hdr as usize + body_len as usize)?;
-        if next <= pos {
+        let end = start.saturating_add(body_len as usize);
+        if end <= pos {
             return None;
         }
-        pos = next;
-    }
-    None
+        pos = end;
+        if let Some(body) = b.get(start..end.min(b.len())) {
+            return Some((id, body));
+        }
+    })
+}
+
+/// Find a child atom inside `b`; returns its payload.
+fn find_atom<'a>(b: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+    atoms(b).find(|(id, _)| id == want).map(|(_, body)| body)
 }
 
 /// First audio sample-entry fourcc in moov/trak/mdia/minf/stbl/stsd
@@ -95,9 +108,9 @@ fn mp4_audio_entry(b: &[u8]) -> Option<[u8; 4]> {
     let moov = find_atom(b, b"moov")?;
     let mut first_any: Option<[u8; 4]> = None;
     let mut sound_entry: Option<[u8; 4]> = None;
-    for_each(moov, b"trak", |trak| {
+    for (_, trak) in atoms(moov).filter(|(id, _)| id == b"trak") {
         let Some(mdia) = find_atom(trak, b"mdia") else {
-            return;
+            continue;
         };
         let entry = find_atom(mdia, b"minf")
             .and_then(|m| find_atom(m, b"stbl"))
@@ -111,7 +124,7 @@ fn mp4_audio_entry(b: &[u8]) -> Option<[u8; 4]> {
                 e.copy_from_slice(&stsd[12..16]);
                 Some(e)
             });
-        let Some(e) = entry else { return };
+        let Some(e) = entry else { continue };
         if first_any.is_none() {
             first_any = Some(e);
         }
@@ -119,39 +132,8 @@ fn mp4_audio_entry(b: &[u8]) -> Option<[u8; 4]> {
         if soun && sound_entry.is_none() {
             sound_entry = Some(e);
         }
-    });
-    sound_entry.or(first_any)
-}
-
-// helper closure over traks; needs a mutable slot for the "found" result
-fn for_each(b: &[u8], want: &[u8; 4], mut f: impl FnMut(&[u8])) {
-    let mut pos = 0usize;
-    while pos + 8 <= b.len() {
-        let size = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as u64;
-        let id = &b[pos + 4..pos + 8];
-        let (hdr, body_len) = match size {
-            0 => (8u64, (b.len() - pos) as u64 - 8),
-            1 => {
-                if pos + 16 > b.len() {
-                    return;
-                }
-                let l = u64::from_be_bytes(b[pos + 8..pos + 16].try_into().unwrap());
-                (16, l.saturating_sub(16))
-            }
-            s => (8, s.saturating_sub(8)),
-        };
-        let start = pos + hdr as usize;
-        let end = start.saturating_add(body_len as usize);
-        if id == want
-            && let Some(body) = b.get(start..end.min(b.len()))
-        {
-            f(body);
-        }
-        if end <= pos {
-            return;
-        }
-        pos = end;
     }
+    sound_entry.or(first_any)
 }
 
 fn ogg_label(b: &[u8]) -> &'static str {
@@ -233,12 +215,30 @@ fn alac_cookie_depth(p: &AudioCodecParameters) -> Option<u32> {
         .and_then(|d| d.get(5).map(|&v| u32::from(v)))
 }
 
-/// Probe + decode all packets of the first audio track. Any decode error is
-/// fatal — silently skipping a packet would store shortened PCM while claiming
-/// the audio is identical.
-fn symphonia_decode(bytes: &[u8]) -> Result<SymDecode, String> {
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-    let mut fmt = get_probe()
+/// Streaming symphonia reader over the first audio track: `next_pcm`
+/// decodes one packet into per-channel i64 planes (left-justified S32
+/// shifted down to the declared bit depth). Any decode error is fatal —
+/// silently skipping a packet would store shortened PCM while claiming the
+/// audio is identical.
+pub struct SymReader<'a> {
+    fmt: Box<dyn FormatReader + 'a>,
+    dec: Box<dyn AudioDecoder>,
+    tid: u32,
+    shift: u32,
+    /// Declared bit depth (1..=31).
+    pub bits: u16,
+    /// Codec of the probed track (CODEC_ID_ALAC etc.).
+    pub codec: AudioCodecId,
+    /// Container-declared frame count (stsz/STREAMINFO), when present.
+    pub n_frames: Option<u64>,
+    fin: bool,
+}
+
+/// Probe `src` and build the decoder. Works on anything symphonia's
+/// `MediaSource` accepts — `File` streams, `Cursor<&[u8]>` reads memory.
+pub fn symphonia_open<'a>(src: Box<dyn MediaSource + 'a>) -> Result<SymReader<'a>, String> {
+    let mss = MediaSourceStream::new(src, Default::default());
+    let fmt = get_probe()
         .probe(
             &Hint::new(),
             mss,
@@ -251,6 +251,7 @@ fn symphonia_decode(bytes: &[u8]) -> Result<SymDecode, String> {
         .or_else(|| fmt.tracks().first())
         .ok_or("no audio track")?;
     let tid = track.id;
+    let n_frames = track.num_frames;
     let params = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p.clone(),
         _ => return Err("no audio codec parameters".into()),
@@ -263,61 +264,130 @@ fn symphonia_decode(bytes: &[u8]) -> Result<SymDecode, String> {
         return Err(format!("unsupported bit depth {bits}"));
     }
     let opts = AudioDecoderOptions::default().verify(true);
-    let mut dec = get_codecs()
+    let dec = get_codecs()
         .make_audio_decoder(&params, &opts)
         .map_err(|e| format!("decoder init: {e}"))?;
-    let shift = 32 - bits;
-    let mut x: Vec<Vec<i64>> = Vec::new();
-    let mut rate = 0u32;
-    loop {
-        let packet = match fmt.next_packet() {
-            Ok(Some(p)) => p,
-            Ok(None) => break,
-            Err(e) => return Err(format!("demuxer: {e}")),
-        };
-        if packet.track_id != tid {
-            continue;
-        }
-        let buf = match dec.decode(&packet) {
-            Ok(b) => b,
-            Err(Error::DecodeError(e)) => return Err(format!("decoder: {e}")),
-            Err(Error::ResetRequired) => return Err("decoder: reset required".into()),
-            Err(e) => return Err(format!("decoder: {e}")),
-        };
-        let GenericAudioBufferRef::S32(b) = buf else {
-            return Err("unexpected decoder buffer format".into());
-        };
-        rate = b.spec().rate();
-        let nch = b.spec().channels().count();
-        if x.is_empty() {
-            x = vec![Vec::new(); nch];
-        } else if x.len() != nch {
-            return Err("channel count changed mid-stream".into());
-        }
-        for (c, dst) in x.iter_mut().enumerate() {
-            let plane = b.plane(c).ok_or("missing channel plane")?;
-            dst.extend(plane.iter().map(|&s| i64::from(s >> shift)));
+    Ok(SymReader {
+        fmt,
+        dec,
+        tid,
+        shift: 32 - bits,
+        bits: bits as u16,
+        codec: params.codec,
+        n_frames,
+        fin: false,
+    })
+}
+
+/// One decoded packet: (sample rate, per-channel sample planes).
+pub type PacketPcm = (u32, Vec<Vec<i64>>);
+
+impl SymReader<'_> {
+    /// One packet's planes (rate, per-channel samples). `None` at end of
+    /// stream — the decoder's MD5 verification runs once there.
+    pub fn next_pcm(&mut self) -> Result<Option<PacketPcm>, String> {
+        loop {
+            let packet = match self.fmt.next_packet() {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    if !self.fin {
+                        self.fin = true;
+                        if self.dec.finalize().verify_ok == Some(false) {
+                            return Err("audio verification (MD5) failed".into());
+                        }
+                    }
+                    return Ok(None);
+                }
+                Err(e) => return Err(format!("demuxer: {e}")),
+            };
+            if packet.track_id != self.tid {
+                continue;
+            }
+            let buf = match self.dec.decode(&packet) {
+                Ok(b) => b,
+                Err(Error::DecodeError(e)) => return Err(format!("decoder: {e}")),
+                Err(Error::ResetRequired) => return Err("decoder: reset required".into()),
+                Err(e) => return Err(format!("decoder: {e}")),
+            };
+            let GenericAudioBufferRef::S32(b) = buf else {
+                return Err("unexpected decoder buffer format".into());
+            };
+            let nch = b.spec().channels().count();
+            let mut planes = Vec::with_capacity(nch);
+            for c in 0..nch {
+                let plane = b.plane(c).ok_or("missing channel plane")?;
+                planes.push(
+                    plane
+                        .iter()
+                        .map(|&s| i64::from(s >> self.shift))
+                        .collect::<Vec<i64>>(),
+                );
+            }
+            return Ok(Some((b.spec().rate(), planes)));
         }
     }
-    let fin = dec.finalize();
-    if fin.verify_ok == Some(false) {
-        return Err("audio verification (MD5) failed".into());
+
+    /// Latest metadata revision (tags + visuals).
+    pub fn metadata(&mut self) -> (Vec<Tag>, Vec<Visual>) {
+        match self.fmt.metadata().skip_to_latest() {
+            Some(rev) => (rev.media.tags.clone(), rev.media.visuals.clone()),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+}
+
+/// Decode all packets of the first audio track into memory.
+fn symphonia_decode(bytes: &[u8]) -> Result<SymDecode, String> {
+    let mut r = symphonia_open(Box::new(Cursor::new(bytes)))?;
+    let mut x: Vec<Vec<i64>> = Vec::new();
+    let mut rate = 0u32;
+    while let Some((rt, planes)) = r.next_pcm()? {
+        rate = rt;
+        if x.is_empty() {
+            x = vec![Vec::new(); planes.len()];
+        } else if x.len() != planes.len() {
+            return Err("channel count changed mid-stream".into());
+        }
+        for (dst, plane) in x.iter_mut().zip(planes) {
+            dst.extend(plane);
+        }
     }
     if x.is_empty() || rate == 0 {
         return Err("no audio decoded".into());
     }
-    let (tags, visuals) = match fmt.metadata().skip_to_latest() {
-        Some(rev) => (rev.media.tags.clone(), rev.media.visuals.clone()),
-        None => (Vec::new(), Vec::new()),
-    };
+    let (tags, visuals) = r.metadata();
     Ok(SymDecode {
         channels: x.len() as u16,
         rate,
-        bits: bits as u16,
+        bits: r.bits,
         x,
         tags,
         visuals,
     })
+}
+
+/// Byte offset where the FLAC metadata chain ends (right after the
+/// last-flagged block), or `None` when `b` doesn't cover it yet / isn't
+/// FLAC.
+pub fn flac_meta_end(b: &[u8]) -> Option<usize> {
+    if !b.starts_with(b"fLaC") {
+        return None;
+    }
+    let mut pos = 4usize;
+    while pos + 4 <= b.len() {
+        let last = b[pos] & 0x80 != 0;
+        let len =
+            (u32::from(b[pos + 1]) << 16) | (u32::from(b[pos + 2]) << 8) | u32::from(b[pos + 3]);
+        let end = pos + 4 + len as usize;
+        if end > b.len() {
+            return None;
+        }
+        pos = end;
+        if last {
+            return Some(pos);
+        }
+    }
+    None
 }
 
 // ------------------------------------------------------------------ tag blob
@@ -385,7 +455,7 @@ fn push_block(out: &mut Vec<u8>, typ: u8, body: &[u8]) {
 
 /// Convert symphonia metadata into a tag blob: one VORBIS_COMMENT block plus
 /// one PICTURE block per visual (type 3 front cover).
-fn symphonia_tag_blob(tags: &[Tag], visuals: &[Visual]) -> Vec<u8> {
+pub fn symphonia_tag_blob(tags: &[Tag], visuals: &[Visual]) -> Vec<u8> {
     let mut out = Vec::new();
     let comments: Vec<(String, String)> = tags
         .iter()
@@ -439,7 +509,7 @@ pub struct PcmSource {
 }
 
 /// STREAMINFO total_samples (bytes 18..26 of the file, low 36 bits); 0 = unknown.
-fn flac_total_samples(b: &[u8]) -> u64 {
+pub fn flac_total_samples(b: &[u8]) -> u64 {
     if b.len() >= 42 && b.starts_with(b"fLaC") && b[4] & 0x7f == 0 {
         u64::from_be_bytes(b[18..26].try_into().unwrap()) & 0x000F_FFFF_FFFF
     } else {
@@ -574,14 +644,26 @@ pub fn encode_flac(
         .write(&mut sink)
         .map_err(|e| format!("flac write: {e}"))?;
     let mut enc = sink.into_inner();
+    let out = flac_finish(&mut enc, tags)?;
+    // verify: re-decode and compare samples
+    let (c2, r2, b2, x2) = decode_pcm(&out)?;
+    if (c2, r2, b2) != (channels, rate, bits) || x2 != x {
+        return Err("flac output verification failed".into());
+    }
+    Ok(out)
+}
+
+/// Patch `enc` (flacenc output: fLaC + STREAMINFO + frames) in place —
+/// flacenc counts the short last block in min_block_size, declaring a
+/// variable-blocksize stream while still emitting fixed-strategy frames;
+/// normalize to libFLAC behavior (min = max) — then splice the preserved
+/// tag blob in after STREAMINFO. Returns the final file image.
+fn flac_finish(enc: &mut [u8], tags: &[u8]) -> Result<Vec<u8>, String> {
     if enc.len() >= 12 {
-        // flacenc counts the short last block in min_block_size, declaring a
-        // variable-blocksize stream while still emitting fixed-strategy frames.
-        // Normalize to libFLAC behavior: min = max (last block may be shorter).
         enc[8] = enc[10];
         enc[9] = enc[11];
     }
-    let (si_end, frames_at) = split_flac(&enc)?;
+    let (si_end, frames_at) = split_flac(enc)?;
     let mut out = Vec::with_capacity(enc.len() + tags.len());
     out.extend(b"fLaC");
     // STREAMINFO, last flag set only when no tag blocks follow
@@ -610,12 +692,164 @@ pub fn encode_flac(
         out[last_at] |= 0x80;
     }
     out.extend(&enc[frames_at..]);
-    // verify: re-decode and compare samples
-    let (c2, r2, b2, x2) = decode_pcm(&out)?;
-    if (c2, r2, b2) != (channels, rate, bits) || x2 != x {
-        return Err("flac output verification failed".into());
-    }
     Ok(out)
+}
+
+// ------------------------------------------- streaming flac export (v1 CLI)
+
+/// flacenc `Source` pulling decoded frame chunks off a channel — the v1
+/// decoder pushes one frame's channels at a time, so decode+export peak is
+/// O(threads * frame), not O(track).
+pub struct PcmPipe {
+    rx: Receiver<Result<Vec<Vec<i64>>, String>>,
+    pend: Vec<VecDeque<i64>>,
+    inter: Vec<i32>,
+    bits: usize,
+    rate: usize,
+    hint: usize,
+}
+
+impl PcmPipe {
+    pub fn new(
+        rx: Receiver<Result<Vec<Vec<i64>>, String>>,
+        channels: u16,
+        bits: u16,
+        rate: u32,
+        frames_hint: u64,
+    ) -> Self {
+        Self {
+            rx,
+            pend: vec![VecDeque::new(); usize::from(channels)],
+            inter: Vec::new(),
+            bits: usize::from(bits),
+            rate: rate as usize,
+            hint: frames_hint.min(usize::MAX as u64) as usize,
+        }
+    }
+}
+
+fn pipe_err(e: String) -> flacenc::error::SourceError {
+    flacenc::error::SourceError::from_io_error(std::io::Error::other(e))
+}
+
+impl flacenc::source::Source for PcmPipe {
+    fn channels(&self) -> usize {
+        self.pend.len()
+    }
+
+    fn bits_per_sample(&self) -> usize {
+        self.bits
+    }
+
+    fn sample_rate(&self) -> usize {
+        self.rate
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.hint)
+    }
+
+    fn read_samples<F: flacenc::source::Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, flacenc::error::SourceError> {
+        while self.pend.iter().map(VecDeque::len).min().unwrap_or(0) < block_size {
+            match self.rx.recv() {
+                Ok(Ok(chunk)) => {
+                    if chunk.len() != self.pend.len() {
+                        return Err(pipe_err("channel count changed mid-stream".into()));
+                    }
+                    for (dst, plane) in self.pend.iter_mut().zip(chunk) {
+                        dst.extend(plane);
+                    }
+                }
+                Ok(Err(e)) => return Err(pipe_err(e)),
+                Err(_) => break,
+            }
+        }
+        let n = self
+            .pend
+            .iter()
+            .map(VecDeque::len)
+            .min()
+            .unwrap_or(0)
+            .min(block_size);
+        self.inter.clear();
+        self.inter.reserve(n * self.pend.len());
+        for f in 0..n {
+            for c in &self.pend {
+                self.inter.push(c[f] as i32);
+            }
+        }
+        dest.fill_interleaved(&self.inter)?;
+        for c in &mut self.pend {
+            c.drain(..n);
+        }
+        Ok(n)
+    }
+}
+
+/// Encode the pipe's samples to `w` (flacenc → `flac_finish`). The caller
+/// verifies via `verify_flac_file` once the producer's pcm CRC is known.
+pub fn encode_flac_stream(
+    rx: Receiver<Result<Vec<Vec<i64>>, String>>,
+    w: &mut impl std::io::Write,
+    bits: u16,
+    channels: u16,
+    rate: u32,
+    tags: &[u8],
+    frames_hint: u64,
+) -> Result<(), String> {
+    use flacenc::bitsink::MemSink;
+    use flacenc::component::BitRepr;
+    use flacenc::error::Verify;
+    let src = PcmPipe::new(rx, channels, bits, rate, frames_hint);
+    let cfg = flacenc::config::Encoder::default()
+        .into_verified()
+        .map_err(|e| format!("flacenc config: {e:?}"))?;
+    let stream = flacenc::encode_with_fixed_block_size(&cfg, src, 4096)
+        .map_err(|e| format!("flacenc: {e}"))?;
+    let mut sink = MemSink::<u8>::new();
+    stream
+        .write(&mut sink)
+        .map_err(|e| format!("flac write: {e}"))?;
+    let out = flac_finish(&mut sink.into_inner(), tags)?;
+    w.write_all(&out)
+        .map_err(|e| format!("flac write: {e}"))
+}
+
+/// Re-decode a just-written FLAC file and compare stream params + the
+/// canonical-PCM CRC against what the pipe was fed. Same guarantee as
+/// `encode_flac`'s in-memory verify, without holding the output samples.
+pub fn verify_flac_file(
+    path: &std::path::Path,
+    channels: u16,
+    rate: u32,
+    bits: u16,
+    want_crc: u32,
+) -> Result<(), String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut r = symphonia_open(Box::new(f)).map_err(|e| format!("flac verify: {e}"))?;
+    let mut crc = crate::bits::Crc32::new();
+    let mut nch = 0usize;
+    let mut rt = 0u32;
+    while let Some((rt2, planes)) = r.next_pcm().map_err(|e| format!("flac verify: {e}"))? {
+        rt = rt2;
+        nch = planes.len();
+        crc.update(&wav::ints_to_pcm(
+            &planes,
+            bits,
+            planes.first().map_or(0, Vec::len),
+        ));
+    }
+    if nch != usize::from(channels) || rt != rate || r.bits != bits {
+        return Err("flac output verification failed (stream params)".into());
+    }
+    if crc.finish() != want_crc {
+        return Err("flac output verification failed (samples)".into());
+    }
+    Ok(())
 }
 
 /// WAV header (RIFF + fmt + data tag/size) for a v1 export of `pcm_len`

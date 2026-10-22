@@ -222,7 +222,7 @@ Per coded signal, in signal order:
 | Field | Bits | Rule |
 |---|---|---|
 | order | 6 | LPC order `o`, `0..=63`; `> 63` impossible (field width) |
-| prec−1 | 4 | only when `o > 0`; coefficient precision `prec = field + 1`. Reference encoder emits 14 (prec 15). `prec > 32` rejected; coefficients are read as signed `prec`-bit values and kept mod 2^16 (i16) |
+| prec−1 | 4 | only when `o > 0`; coefficient precision `prec = field + 1` (so 1..=16). Reference encoder emits 14 (prec 15); coefficients are read as signed `prec`-bit values and kept mod 2^16 (i16) |
 | qshift | 5 | only when `o > 0`; prediction right-shift |
 | coefficients | `o` × `prec` | only when `o > 0`; signed `prec`-bit fields, order k = 1..o |
 | wbits | 6 | only in **block 0** of a frame **and** `o > 0`; see §8.4 |
@@ -460,7 +460,7 @@ A conforming decoder MUST reject on:
 | 3 | per-meta: `name_len > 4096`, name not UTF-8, `origin > 3`, `rate == 0`, `channels` outside `1..=16`, invalid `sample_fmt`/`bits` combination, `tags_len > 2^24`, `nframes == 0` XOR `frames == 0`, `nframes ≠ ceil(frames/frame_len)`, `nframes > frame_span/22` |
 | 4 | `index_off` nonzero but `< meta_end`; index size `> file_len − index_off`; index CRC mismatch; an index offset outside `[meta_end, index_off − 22]` |
 | 5 | per frame: bad sync, `track ≥ ntracks`, `frame_no ≥ nframes` (implied by `n` check), `n` ≠ `min(frame_len, frames − frame_no·frame_len)`, `fmode` inconsistent with `sample_fmt`/`bits`, `e ≠ 0` on `fmode 0`, record extending past file end, frame CRC mismatch |
-| 6 | payload: any read past the payload ("truncated payload"/"bitstream overrun"), stereo `mode > 5`, `order > 63` (impossible — u6 field), `prec > 32`, LTP `τ == 0`, warm-up residual nonzero, partition `p > 8` or `2^p ∤ n`, param `63`, escape `width > 63`, rANS blob < 3 cells, rANS unary run > 2^26, Rice unary run > 2^32, `bit_len(|I|) > mw + 1`, float exponent `ef` outside `(0, emask)` |
+| 6 | payload: any read past the payload ("truncated payload"/"bitstream overrun"), stereo `mode > 5`, `order > 63` (impossible — u6 field), LTP `τ == 0`, warm-up residual nonzero, partition `p > 8` or `2^p ∤ n`, param `63`, escape `width > 63`, rANS blob < 3 cells, rANS unary run > 2^26 per symbol or a cumulative 0-bit run > `16384 × ncells` per partition, Rice unary run > 2^32, `bit_len(|I|) > mw + 1`, float exponent `ef` outside `(0, emask)` |
 | 7 | decoded int sample outside the declared bit range |
 | 8 | `decode_track`: `pcm_crc` mismatch |
 

@@ -1,10 +1,14 @@
-//! v1 encoder: streams WAV/AIFF from disk in frame-sized chunks (FLAC/ALAC
-//! decoded whole via symphonia), codes each frame independently through the
-//! shared codec, patches the placeholder fields at finish.
+//! v1 encoder: streams all inputs from disk in frame-sized chunks (WAV/AIFF
+//! by file reads, FLAC/ALAC by symphonia packets), codes each frame
+//! independently through the shared codec, patches the placeholder fields
+//! at finish.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+
+use symphonia::core::codecs::audio::well_known;
 
 use crate::bits::{BitWriter, Crc32, crc32};
 use crate::codec::{self, DBit, FloatData, TrackCtx};
@@ -68,10 +72,13 @@ enum Src {
         align: usize,
         aiff: Option<aiff::AiffHead>,
     },
-    /// Whole track already decoded (FLAC/ALAC) — integer samples only.
-    /// shortcut: holds all samples in memory; streaming a symphonia source
-    /// frame-by-frame is possible but not needed yet.
-    Mem { x: Vec<Vec<i64>>, pos: usize },
+    /// Symphonia packet decoder (FLAC/ALAC): `pend` holds the
+    /// decoded-but-unread prefix of each channel. Peak memory is a packet
+    /// plus one frame per track, not the whole track.
+    Sym {
+        r: formats::SymReader<'static>,
+        pend: Vec<VecDeque<i64>>,
+    },
 }
 
 /// (frames actually read, integer samples, float words when FMT_FLOAT).
@@ -85,6 +92,9 @@ struct TrackSrc {
     mask: u32,
     sample_fmt: u8,
     bits: u8,
+    /// Declared sample count; `u64::MAX` when the container doesn't say
+    /// (m4a without stsz). Only used as a gather bound + validation —
+    /// the real count lands in `enc_n` and patches the meta.
     frames: u64,
     tags: Vec<u8>,
     input_bytes: u64,
@@ -93,7 +103,7 @@ struct TrackSrc {
 
 impl TrackSrc {
     fn nframes(&self, frame_len: u32) -> u32 {
-        self.frames.div_ceil(u64::from(frame_len)) as u32
+        u32::try_from(self.frames.div_ceil(u64::from(frame_len))).unwrap_or(u32::MAX)
     }
 
     /// Up to `n` samples per channel: integer samples, or float words.
@@ -101,10 +111,29 @@ impl TrackSrc {
     fn read_frame(&mut self, n: usize) -> Result<FramePcm, String> {
         let ch = self.channels as usize;
         match &mut self.src {
-            Src::Mem { x, pos } => {
-                let out: Vec<Vec<i64>> = x.iter().map(|c| c[*pos..*pos + n].to_vec()).collect();
-                *pos += n;
-                Ok((n, out, None))
+            Src::Sym { r, pend } => {
+                while pend.iter().map(VecDeque::len).min().unwrap_or(0) < n {
+                    match r.next_pcm()? {
+                        Some((_, planes)) => {
+                            if planes.len() != pend.len() {
+                                return Err(format!(
+                                    "{}: channel count changed mid-stream",
+                                    self.name
+                                ));
+                            }
+                            for (dst, pl) in pend.iter_mut().zip(planes) {
+                                dst.extend(pl);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                let got = pend.iter().map(VecDeque::len).min().unwrap_or(0).min(n);
+                let out = pend
+                    .iter_mut()
+                    .map(|p| p.drain(..got).collect())
+                    .collect();
+                Ok((got, out, None))
             }
             Src::Stream {
                 r,
@@ -183,6 +212,35 @@ fn lossy_err(name: &str, kind: &str) -> String {
 }
 
 const HEAD_READ: usize = 1 << 16;
+const HEAD_MAX: u64 = 1 << 26;
+
+/// `scan` can fail only because the payload chunk lies past the head
+/// window — grow the buffer (doubling, up to HEAD_MAX) and retry. Errors
+/// that are not truncation surface unchanged once the bound is hit.
+fn head_scan<T>(
+    br: &mut BufReader<File>,
+    head: &mut Vec<u8>,
+    file_len: u64,
+    name: &str,
+    scan: impl Fn(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    loop {
+        match scan(head.as_slice()) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let room = HEAD_MAX.min(file_len).saturating_sub(head.len() as u64);
+                if room == 0 {
+                    return Err(format!("{name}: {e}"));
+                }
+                let add = (head.len() as u64).min(room) as usize;
+                let at = head.len();
+                head.resize(at + add, 0);
+                br.read_exact(&mut head[at..])
+                    .map_err(|e2| format!("{name}: read header: {e2}"))?;
+            }
+        }
+    }
+}
 
 fn open_input(inp: &V1Input) -> Result<TrackSrc, String> {
     if !valid_name(&inp.name) {
@@ -200,7 +258,7 @@ fn open_input(inp: &V1Input) -> Result<TrackSrc, String> {
     match formats::sniff(&head) {
         Sniff::Wav => {
             let (fmt, pcm_start, size) =
-                wav::scan_prefix(&head).map_err(|e| format!("{}: {e}", inp.name))?;
+                head_scan(&mut br, &mut head, file_len, &inp.name, wav::scan_prefix)?;
             if fmt.rate == 0 {
                 return Err(format!("{}: sample rate 0", inp.name));
             }
@@ -228,7 +286,7 @@ fn open_input(inp: &V1Input) -> Result<TrackSrc, String> {
             })
         }
         Sniff::Aiff => {
-            let h = aiff::scan_prefix(&head).map_err(|e| format!("{}: {e}", inp.name))?;
+            let h = head_scan(&mut br, &mut head, file_len, &inp.name, aiff::scan_prefix)?;
             if h.fmt.rate == 0 {
                 return Err(format!("{}: sample rate 0", inp.name));
             }
@@ -240,7 +298,7 @@ fn open_input(inp: &V1Input) -> Result<TrackSrc, String> {
             }
             let align = u64::from(h.fmt.block_align);
             let avail = (h.avail as u64).min(file_len - h.pcm_start as u64);
-            let frames = avail / align;
+            let frames = (avail / align).min(h.frames);
             br.seek(SeekFrom::Start(h.pcm_start as u64))
                 .map_err(|e| format!("{}: seek: {e}", inp.name))?;
             Ok(TrackSrc {
@@ -262,8 +320,12 @@ fn open_input(inp: &V1Input) -> Result<TrackSrc, String> {
                 },
             })
         }
-        Sniff::Flac => mem_track(inp, br, head, file_len, ORIGIN_FLAC),
-        Sniff::Mp4(e) if &e == b"alac" => mem_track(inp, br, head, file_len, ORIGIN_ALAC),
+        Sniff::Flac => sym_track(inp, &mut br, &mut head, file_len, ORIGIN_FLAC),
+        Sniff::Mp4(e) if &e == b"alac" => sym_track(inp, &mut br, &mut head, file_len, ORIGIN_ALAC),
+        // moov may sit past the head window (non-faststart m4a); only ALAC
+        // can decode through symphonia here, so probe instead of guessing.
+        Sniff::Mp4(e) if e == [0; 4] => sym_track(inp, &mut br, &mut head, file_len, ORIGIN_ALAC)
+            .map_err(|_| lossy_err(&inp.name, "m4a")),
         Sniff::Mp4(entry) => Err(lossy_err(
             &inp.name,
             if &entry == b"mp4a" { "m4a aac" } else { "m4a" },
@@ -273,42 +335,75 @@ fn open_input(inp: &V1Input) -> Result<TrackSrc, String> {
     }
 }
 
-/// FLAC/ALAC input: decode the whole file via symphonia into a memory source.
-/// shortcut: holds all samples in memory (streaming the decoder is possible
-/// but not needed yet).
-fn mem_track(
+/// FLAC/ALAC input: probe with symphonia and keep the packet decoder as the
+/// frame source (`Src::Sym`), so encode memory stays O(threads * frame).
+/// `head`/`br` are only needed for FLAC, whose tag blob lives in the
+/// container's own metadata chain — grow `head` until it is covered.
+fn sym_track(
     inp: &V1Input,
-    mut br: BufReader<File>,
-    mut all: Vec<u8>,
+    br: &mut BufReader<File>,
+    head: &mut Vec<u8>,
     file_len: u64,
     origin: u8,
 ) -> Result<TrackSrc, String> {
-    br.read_to_end(&mut all)
-        .map_err(|e| format!("{}: read: {e}", inp.name))?;
-    let s = if origin == ORIGIN_FLAC {
-        formats::read_flac(&all).map_err(|e| format!("{}: {e}", inp.name))?
+    let meta_end = if origin == ORIGIN_FLAC {
+        while formats::flac_meta_end(head).is_none() && (head.len() as u64) < file_len {
+            let add = (head.len() as u64).min(file_len - head.len() as u64) as usize;
+            let at = head.len();
+            head.resize(at + add, 0);
+            br.read_exact(&mut head[at..])
+                .map_err(|e| format!("{}: read header: {e}", inp.name))?;
+        }
+        formats::flac_meta_end(head)
+            .ok_or_else(|| format!("{}: unterminated flac metadata", inp.name))?
     } else {
-        formats::read_m4a(&all).map_err(|e| format!("{}: {e}", inp.name))?
+        0
     };
-    if s.channels == 0 || s.channels > u16::from(MAX_CHANNELS) || s.rate == 0 {
+    let f = File::open(&inp.path).map_err(|e| format!("{}: {e}", inp.name))?;
+    let mut r = formats::symphonia_open(Box::new(f)).map_err(|e| format!("{}: {e}", inp.name))?;
+    if !matches!(
+        r.codec,
+        well_known::CODEC_ID_FLAC | well_known::CODEC_ID_ALAC
+    ) {
+        return Err(format!("{}: unsupported audio codec", inp.name));
+    }
+    let (rate, planes) = r
+        .next_pcm()
+        .map_err(|e| format!("{}: {e}", inp.name))?
+        .ok_or_else(|| format!("{}: no audio decoded", inp.name))?;
+    let channels = planes.len();
+    if rate == 0 || channels == 0 || channels > usize::from(MAX_CHANNELS) {
         return Err(format!("{}: bad channel/rate", inp.name));
     }
-    if !matches!(s.bits, 8 | 16 | 24 | 32) {
-        return Err(format!("{}: unsupported bit depth {}", inp.name, s.bits));
+    if !matches!(r.bits, 8 | 16 | 24) {
+        return Err(format!("{}: unsupported bit depth {}", inp.name, r.bits));
     }
-    let frames = s.x.first().map_or(0, |c| c.len()) as u64;
+    let declared = if origin == ORIGIN_FLAC {
+        formats::flac_total_samples(head)
+    } else {
+        r.n_frames.unwrap_or(0)
+    };
+    let tags = if origin == ORIGIN_FLAC {
+        formats::flac_tag_blocks(&head[..meta_end])
+    } else {
+        let (tags, visuals) = r.metadata();
+        formats::symphonia_tag_blob(&tags, &visuals)
+    };
     Ok(TrackSrc {
         name: inp.name.clone(),
         origin,
-        rate: s.rate,
-        channels: s.channels as u8,
+        rate,
+        channels: channels as u8,
         mask: 0,
         sample_fmt: FMT_INT,
-        bits: s.bits as u8,
-        frames,
-        tags: s.tags,
+        bits: r.bits as u8,
+        frames: if declared == 0 { u64::MAX } else { declared },
+        tags,
         input_bytes: file_len,
-        src: Src::Mem { x: s.x, pos: 0 },
+        src: Src::Sym {
+            r,
+            pend: planes.into_iter().map(VecDeque::from).collect(),
+        },
     })
 }
 
@@ -482,7 +577,7 @@ pub fn encode<W: Write + Seek>(
         .map_err(|e| format!("write: {e}"))?; // meta crc placeholder
 
     // Frame loop: gather frame-major/track-minor jobs in batches of
-    // 2*threads, code them in parallel, write in order — byte-identical for
+    // `threads`, code them in parallel, write in order — byte-identical for
     // any thread count.
     let mut pcm_crcs: Vec<Crc32> = srcs.iter().map(|_| Crc32::new()).collect();
     let mut done: Vec<u64> = vec![0; srcs.len()]; // frames consumed per track
@@ -490,9 +585,17 @@ pub fn encode<W: Write + Seek>(
     let mut coded: Vec<u64> = vec![0; srcs.len()]; // frame record bytes per track
     let mut index: Vec<Vec<u64>> = srcs
         .iter()
-        .map(|s| Vec::with_capacity(s.nframes(fl) as usize))
+        .map(|s| {
+            Vec::with_capacity(if s.frames == u64::MAX {
+                0
+            } else {
+                s.nframes(fl) as usize
+            })
+        })
         .collect();
-    let batch_n = (2 * threads).max(1);
+    // One queued job per worker: gather is sequential anyway, so deeper
+    // queues only hold finished frames hostage in memory.
+    let batch_n = threads.max(1);
     let mut batch: Vec<Job> = Vec::with_capacity(batch_n);
 
     let flush = |batch: &mut Vec<Job>,
@@ -557,6 +660,27 @@ pub fn encode<W: Write + Seek>(
         f += 1;
     }
     flush(&mut batch, out, &mut coded, &mut index)?;
+
+    // Declared counts must match what was actually decoded: STREAMINFO /
+    // stsz can lie in either direction (streamed reads would silently
+    // truncate an over-declared container without this).
+    for (t, s) in srcs.iter_mut().enumerate() {
+        if s.frames == u64::MAX {
+            continue;
+        }
+        if enc_n[t] != s.frames {
+            return Err(format!(
+                "{}: decoded {} samples, container declares {}",
+                s.name, enc_n[t], s.frames
+            ));
+        }
+        if matches!(s.src, Src::Sym { .. }) && s.read_frame(1)?.0 != 0 {
+            return Err(format!(
+                "{}: stream continues past declared frame count {}",
+                s.name, s.frames
+            ));
+        }
+    }
 
     // Index.
     let index_off = if opts.index {

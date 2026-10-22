@@ -330,7 +330,7 @@ impl<R: Read + Seek> Reader<R> {
 
     /// `decode_range_with` with frame decode spread over `threads` scoped
     /// workers when an index exists and the range spans several frames:
-    /// a window of `2*threads` frame payloads is read sequentially, decoded
+    /// a window of `threads` frame payloads is read sequentially, decoded
     /// in parallel, then handed to `sink` in order. Falls back to the
     /// sequential path when `threads <= 1`, the index is absent, or the
     /// range covers fewer than 4 frames.
@@ -370,9 +370,10 @@ impl<R: Read + Seek> Reader<R> {
                 self.index.as_ref().unwrap()[track][f0 as usize..=f1 as usize].to_vec();
             if threads > 1 && offs.len() >= 4 {
                 // Bounded window: read payloads sequentially, decode on
-                // scoped workers, sink in frame order. Memory stays
-                // O(threads * frame).
-                let win = (threads * 2).max(4).min(offs.len());
+                // scoped workers, sink in frame order. One job in flight
+                // per worker — a deeper window would only hold finished
+                // frames hostage. Memory stays O(threads * frame).
+                let win = threads.max(4).min(offs.len());
                 let m = sl.m;
                 let mut w0 = 0usize;
                 while w0 < offs.len() {
@@ -587,6 +588,32 @@ impl<R: Read + Seek> Reader<R> {
             Samples::Float(out_f)
         })
     }
+
+    /// Decode the whole track checking only `pcm_crc` — decoded frames are
+    /// consumed by the crc and dropped, so peak memory is
+    /// O(threads * frame), not O(track).
+    pub fn verify_track(&mut self, track: usize) -> Result<(), String> {
+        self.verify_track_par(track, 1)
+    }
+
+    /// `verify_track` with parallel frame decode — see
+    /// `decode_range_with_par` for the scheduling rules.
+    pub fn verify_track_par(&mut self, track: usize, threads: usize) -> Result<(), String> {
+        let m = self
+            .tracks
+            .get(track)
+            .cloned()
+            .ok_or_else(|| format!("track {track} out of range"))?;
+        let mut crc = Crc32::new();
+        self.decode_range_with_par(track, 0, m.frames, threads, |s| {
+            crc.update(&samples_to_pcm(&s, m.bits));
+            Ok(())
+        })?;
+        if crc.finish() != m.pcm_crc {
+            return Err(format!("track {track}: pcm_crc mismatch"));
+        }
+        Ok(())
+    }
 }
 
 /// The `[start, end)` slice parameters shared by `feed_frame` calls.
@@ -740,6 +767,8 @@ fn plausible(h: &FrameHead, tracks: &[TrackInfo], frame_len: u32, off: u64, end:
 
 /// Scan forward from `off` for the next position whose header is plausible
 /// AND whose frame CRC verifies. Returns (offset, head, full frame bytes).
+/// Reads the region in windows and filters header candidates in memory —
+/// one seek per window, not per offset.
 fn resync<R: Read + Seek>(
     r: &mut R,
     mut off: u64,
@@ -747,21 +776,34 @@ fn resync<R: Read + Seek>(
     frame_len: u32,
     tracks: &[TrackInfo],
 ) -> Result<Option<(u64, FrameHead, Vec<u8>)>, String> {
+    const WIN: u64 = 1 << 20;
     while off + FRAME_HDR_LEN as u64 + 4 <= end {
-        if let Ok(h) = read_head(r, off)
-            && plausible(&h, tracks, frame_len, off, end)
-        {
+        let span = (end - off).min(WIN) as usize;
+        let mut win = vec![0u8; span];
+        r.seek(SeekFrom::Start(off))
+            .map_err(|e| format!("seek: {e}"))?;
+        r.read_exact(&mut win).map_err(|e| format!("read: {e}"))?;
+        for rel in 0..=(span - FRAME_HDR_LEN) {
+            let at = off + rel as u64;
+            let Ok(h) = parse_frame_head(&win[rel..rel + FRAME_HDR_LEN]) else {
+                continue;
+            };
+            if !plausible(&h, tracks, frame_len, at, end) {
+                continue;
+            }
             let total = FRAME_HDR_LEN as u64 + u64::from(h.payload_len) + 4;
             let mut buf = vec![0u8; total as usize];
-            r.seek(SeekFrom::Start(off))
+            r.seek(SeekFrom::Start(at))
                 .map_err(|e| format!("seek: {e}"))?;
             r.read_exact(&mut buf).map_err(|e| format!("read: {e}"))?;
             let (body, tail) = buf.split_at(buf.len() - 4);
             if crc32(body) == u32le(tail, 0) {
-                return Ok(Some((off, h, buf)));
+                return Ok(Some((at, h, buf)));
             }
         }
-        off += 1;
+        // keep the last header-width minus one byte in the next window so
+        // headers straddling the edge are still found
+        off += (span - FRAME_HDR_LEN + 1) as u64;
     }
     Ok(None)
 }

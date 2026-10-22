@@ -44,9 +44,10 @@ them back; `flq bench` round-trips in memory. Normative bitstream:
   before decode reports success.
 - Reject anything that isn't smaller/well-formed: crafted-input guards on
   read (allocation caps, unary-run cap, escape-width cap, range checks).
-- `enc.rs` streams WAV/AIFF input (header scan then per-frame reads);
-  FLAC/ALAC inputs are decoded whole via symphonia first
-  (`shortcut:` in `v1/enc.rs`).
+- `enc.rs` streams every input: WAV/AIFF by per-frame file reads,
+  FLAC/ALAC by symphonia packets (`Src::Sym` in `v1/enc.rs`); the
+  declared STREAMINFO/stsz count is validated against the decoded total
+  at end of encode.
 
 ## Build / test
 
@@ -125,8 +126,9 @@ encode ≤ 53 MiB heap, decode 0.6 MiB at -j1 / ≤ 27 MiB at -j24.
 
 ## Known limits
 
-- Encode streams WAV/AIFF but FLAC/ALAC inputs are decoded whole first
-  (`shortcut:` in `v1/enc.rs`); decode is O(frame).
+- Encode and decode peak at O(threads * frame); `decode --format flac`
+  streams decoded frames into flacenc over a channel (output image still
+  materialized whole by `MemSink`).
 - Sniff order matters in `formats::sniff`: ADTS is checked before
   generic MPEG audio (both start 0xFF); MP4 family keeps the first
   audio sample-entry fourcc (`alac` -> PCM path, anything else ->
@@ -150,8 +152,10 @@ encode ≤ 53 MiB heap, decode 0.6 MiB at -j1 / ≤ 27 MiB at -j24.
 - `src/wav.rs` — RIFF/WAVE parsing, prefix/PCM/suffix split
 - `src/aiff.rs` — AIFF/AIFF-C parsing to `wav::Wav` conventions, native
   PCM write-back
-- `src/formats.rs` — format sniffing, Symphonia FLAC/ALAC decode, tag
-  blobs, flacenc encode + splice + re-decode verify, `decode_pcm`
+- `src/formats.rs` — format sniffing, `SymReader`/`symphonia_open`
+  streaming Symphonia decode, tag blobs, flacenc encode + splice +
+  verify (`PcmPipe` channel source + `verify_flac_file` for the CLI
+  stream path), `decode_pcm`
 - `src/codec.rs` — float split, stereo modes (incl. adaptive-gain 4/5),
   LPC (orders ≤ 63, warm-up), LTP pitch pass, LMS last-mile pass, block
   plan/write/read

@@ -72,7 +72,7 @@ pub(crate) fn put_u64(v: &mut Vec<u8>, n: u64) {
 /// Track names become output filenames on decode: reject path pieces,
 /// `:` (drive letters/ADS), trailing space/dot (Windows trims them), and
 /// Windows device names — with or without an extension (`con`, `con.wav`).
-pub(crate) fn valid_name(n: &str) -> bool {
+pub fn valid_name(n: &str) -> bool {
     if n.is_empty()
         || n == "."
         || n == ".."

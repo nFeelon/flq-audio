@@ -142,8 +142,9 @@ function setPlaying(on) {
 }
 
 function setPlayIcon(playing) {
-  $('play').querySelector('.i-play').hidden = playing;
-  $('play').querySelector('.i-pause').hidden = !playing;
+  // toggleAttribute: .hidden property doesn't reflect to the attribute on SVG
+  $('play').querySelector('.i-play').toggleAttribute('hidden', playing);
+  $('play').querySelector('.i-pause').toggleAttribute('hidden', !playing);
 }
 
 function playPos() {

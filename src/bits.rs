@@ -469,6 +469,11 @@ pub fn read_residual(r: &mut BitReader<'_>, n: usize) -> Result<Vec<i64>, String
                 let mut ctxs = Vec::new();
                 ctxs.resize(64, crate::rc::ProbBin::new());
                 let mut dec = crate::rc::RcDec::new(&cells)?;
+                // A 0-bit costs >= -log2(1 - 4/4096) blob bits, so a legit
+                // stream yields < ~11372 zeros per cell; 16384/cell is the
+                // hard budget (exhausted cells would otherwise loop ~2^26
+                // per sample on a 3-cell blob).
+                let mut budget = (cells.len() as u64) << 14;
                 for v in s.iter_mut() {
                     // unary quotient: 0-bits until the stop bit, context per
                     // run position capped at 63
@@ -479,6 +484,10 @@ pub fn read_residual(r: &mut BitReader<'_>, n: usize) -> Result<Vec<i64>, String
                             break;
                         }
                         q += 1;
+                        if budget == 0 {
+                            return Err("rANS unary budget exceeded".into());
+                        }
+                        budget -= 1;
                         // encoder-side cap in rans_encode_part is 1<<26
                         if q > 1 << 26 {
                             return Err("unary run too long".into());

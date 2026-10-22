@@ -230,6 +230,8 @@ unsafe fn autocorr_avx2(xw: &[f64], r: &mut [f64; MAX_ORDER + 1]) {
         }
         let mut acc = _mm256_setzero_pd();
         let mut tmp = [0f64; 4];
+        // SAFETY: target_feature(avx2) gates this fn; i - hi + 3 < n since
+        // hi >= 3 and i < n, so the unaligned 4-lane load stays in bounds.
         unsafe {
             for i in hi..n {
                 let m = _mm256_loadu_pd(xw.as_ptr().add(i - hi));
@@ -362,7 +364,9 @@ fn eval_order(w: &[i64], n: usize, o: usize, qshift: u8, q: Vec<i16>, warm: usiz
     let warm = warm.min(n);
     let warm_vals: Vec<i64> = (0..warm).map(|i| w[MAX_ORDER + i]).collect();
     let wbits = signed_bits(&warm_vals);
-    let (warm_wbits, warm_vals, nw) = if warm > 0 && wbits <= 63 {
+    // the decoder reads `order` warm-up fields, so a block shorter than the
+    // order cannot carry them verbatim — fall back to wbits=0
+    let (warm_wbits, warm_vals, nw) = if warm == o && warm > 0 && wbits <= 63 {
         (Some(wbits), warm_vals.clone(), warm)
     } else if warm > 0 {
         (Some(0), Vec::new(), 0)
@@ -814,11 +818,6 @@ pub fn plan_track_with(ctx: &TrackCtx<'_>, preset: u8, threads: usize) -> TrackP
         });
     }
 
-    // Long-term prediction post-pass: for each coded signal in each block,
-    // pitch-predict the LPC residual (e[n] -= round(g·e[n−τ])) when it pays
-    // for its 21-bit header. History = the reconstructed residual stream
-    // (pre-LTP values), capped at the last LTP_MAX_LAG samples — identical
-    // on encode and decode.
     // Long-term prediction post-pass: for each coded signal in each block,
     // pitch-predict the LPC residual (e[n] -= round(g·e[n−τ])) when it pays
     // for its 21-bit header. `hist[s]` carries the reconstructed residual

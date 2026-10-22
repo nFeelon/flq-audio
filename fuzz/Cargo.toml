@@ -18,3 +18,9 @@ name = "v1_reader"
 path = "fuzz_targets/v1_reader.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "codec_payload"
+path = "fuzz_targets/codec_payload.rs"
+test = false
+doc = false

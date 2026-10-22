@@ -54,6 +54,7 @@ fn positional(args: &[String]) -> Result<(Vec<String>, v1::enc::V1Opts), String>
                 Ok(n) if n >= 1 => opts.threads = n,
                 _ => return Err(USAGE.into()),
             },
+            a if a.starts_with('-') => return Err(USAGE.into()),
             a => pos.push(a.to_string()),
         }
         i += 1;
@@ -85,6 +86,8 @@ fn grow(n: usize) {
     PEAK.fetch_max(CUR.fetch_add(n, Relaxed) + n, Relaxed);
 }
 
+// SAFETY: pure accounting around System — same layout passed through
+// unchanged, counts updated only on success.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(l) };
@@ -140,6 +143,8 @@ fn cpu_time() -> Option<Duration> {
         ) -> i32;
     }
     let [mut c, mut e, mut k, mut u] = [(); 4].map(|_| FileTime::default());
+    // SAFETY: GetProcessTimes writes FILETIME-sized output into each
+    // pointer; FileTime is #[repr(C)] and 8 bytes, matching the API.
     let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
     let ns = |f: &FileTime| ((f.hi as u64) << 32 | f.lo as u64) * 100;
     (ok != 0).then(|| Duration::from_nanos(ns(&k) + ns(&u)))
@@ -210,15 +215,6 @@ fn print_metrics(label: &str, m: &Metrics, audio: Option<f64>) {
     );
 }
 
-fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(data))
-        .map_err(|e| format!("{}: {e}", path.display()))
-}
-
 fn v1_inputs(ins: &[String]) -> Result<Vec<v1::enc::V1Input>, String> {
     ins.iter()
         .map(|p| {
@@ -283,6 +279,19 @@ fn print_stats(s: &v1::enc::V1Stats, metas: &[v1::TrackInfo]) {
     );
 }
 
+/// `.part` doubles as an exclusive lock — an existing one usually means a
+/// crashed run, not a live writer, so say so in the error.
+fn part_open_err(part: &Path, e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        format!(
+            "{} already exists — stale temp file? delete it or choose another output",
+            part.display()
+        )
+    } else {
+        format!("{}: {e}", part.display())
+    }
+}
+
 /// `flq encode` — the framed format.
 fn cmd_encode(ins: &[String], out: &str, opts: &v1::enc::V1Opts) -> Result<(), String> {
     if Path::new(out).exists() {
@@ -290,16 +299,31 @@ fn cmd_encode(ins: &[String], out: &str, opts: &v1::enc::V1Opts) -> Result<(), S
     }
     let inputs = v1_inputs(ins)?;
     let out_path = PathBuf::from(out);
+    let part = PathBuf::from(format!("{out}.part"));
     let (r, m) = measure(
         move || -> Result<(v1::enc::V1Stats, Vec<v1::TrackInfo>), String> {
             let f = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&out_path)
-                .map_err(|e| format!("{out}: {e}"))?;
+                .open(&part)
+                .map_err(|e| part_open_err(&part, e))?;
             let mut w = std::io::BufWriter::new(f);
-            let st = v1::enc::encode(&inputs, &mut w, opts)?;
-            w.flush().map_err(|e| format!("{out}: {e}"))?;
+            let res = (|| -> Result<v1::enc::V1Stats, String> {
+                let st = v1::enc::encode(&inputs, &mut w, opts)?;
+                w.flush().map_err(|e| format!("{}: {e}", part.display()))?;
+                Ok(st)
+            })();
+            drop(w);
+            let st = match res {
+                Ok(st) => {
+                    fs::rename(&part, &out_path).map_err(|e| format!("{out}: {e}"))?;
+                    st
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&part);
+                    return Err(e);
+                }
+            };
             // re-read the metas for the summary print
             let rd = v1::dec::Reader::open(std::io::BufReader::new(
                 std::fs::File::open(&out_path).map_err(|e| format!("{out}: {e}"))?,
@@ -333,34 +357,6 @@ fn default_ext(m: &v1::TrackInfo) -> &'static str {
     } else {
         "wav"
     }
-}
-
-/// Samples -> output file bytes in the chosen format.
-fn export(m: &v1::TrackInfo, s: &v1::dec::Samples, ext: &str) -> Result<Vec<u8>, String> {
-    if ext == "flac" {
-        let v1::dec::Samples::Int(x) = s else {
-            return Err(format!(
-                "track {}: FLAC can't hold f{}; use --format wav",
-                m.name, m.bits
-            ));
-        };
-        if m.bits == 32 {
-            return Err(format!(
-                "track {}: FLAC can't hold i32; use --format wav",
-                m.name
-            ));
-        }
-        return formats::encode_flac(x, u16::from(m.bits), u16::from(m.channels), m.rate, &m.tags);
-    }
-    let pcm = v1::dec::samples_to_pcm(s, m.bits);
-    Ok(formats::make_wav_v1(
-        &pcm,
-        m.sample_fmt,
-        m.bits,
-        m.channels,
-        m.rate,
-        m.channel_mask,
-    ))
 }
 
 /// Sample range for a `--range` option on one track: (start, len) with len
@@ -415,7 +411,7 @@ fn stream_wav_out<R: Read + Seek>(
         .write(true)
         .create_new(true)
         .open(&part)
-        .map_err(|e| format!("{}: {e}", part.display()))?;
+        .map_err(|e| part_open_err(&part, e))?;
     let mut w = BufWriter::new(f);
     let res = (|| -> Result<(), String> {
         w.write_all(&head)
@@ -450,6 +446,96 @@ fn stream_wav_out<R: Read + Seek>(
             let _ = fs::remove_file(&part);
             Err(e)
         }
+    }
+}
+
+/// Stream a FLAC export: decoded frames flow through a channel — the v1
+/// decoder pushes on a scoped thread, flacenc pulls and writes
+/// `<out>.part` here. The file is then re-decoded and CRC-verified, and
+/// renamed on success; on any error the .part is deleted. Peak memory is
+/// O(threads * frame) + the encoded output, never O(track).
+fn stream_flac_out<R: Read + Seek + Send>(
+    rd: &mut v1::dec::Reader<R>,
+    track: usize,
+    t: &v1::TrackInfo,
+    range: Option<(f64, Option<f64>)>,
+    threads: usize,
+    out: &Path,
+) -> Result<u64, String> {
+    if t.sample_fmt != v1::FMT_INT {
+        return Err(format!(
+            "track {}: FLAC can't hold f{}; use --format wav",
+            t.name, t.bits
+        ));
+    }
+    if t.bits == 32 {
+        return Err(format!(
+            "track {}: FLAC can't hold i32; use --format wav",
+            t.name
+        ));
+    }
+    let (start, len) = range_bounds(t, range)?;
+    let out_frames = len.min(t.frames.saturating_sub(start));
+    let part = PathBuf::from(format!("{}.part", out.display()));
+    let f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .map_err(|e| part_open_err(&part, e))?;
+    let res = std::thread::scope(|sc| -> Result<u32, String> {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Result<Vec<Vec<i64>>, String>>(threads.max(4));
+        let rd = &mut *rd;
+        let prod = sc.spawn(move || -> Result<u32, String> {
+            let mut crc = v1::dec::Crc32::new();
+            rd.decode_range_with_par(track, start, len, threads, |s| {
+                let v1::dec::Samples::Int(x) = s else {
+                    return Err(format!("track {}: unexpected float samples", t.name));
+                };
+                crc.update(&wav::ints_to_pcm(
+                    &x,
+                    u16::from(t.bits),
+                    x.first().map_or(0, Vec::len),
+                ));
+                tx.send(Ok(x)).map_err(|_| "flac pipe closed".to_string())
+            })?;
+            Ok(crc.finish())
+        });
+        let enc = (|| -> Result<(), String> {
+            let mut w = BufWriter::new(f);
+            formats::encode_flac_stream(
+                rx,
+                &mut w,
+                u16::from(t.bits),
+                u16::from(t.channels),
+                t.rate,
+                &t.tags,
+                out_frames,
+            )?;
+            w.flush().map_err(|e| format!("{}: {e}", part.display()))
+        })();
+        let prod = prod.join().map_err(|_| "decode worker panicked".to_string());
+        enc.and(prod?)
+    });
+    let done = res.and_then(|crc| {
+        formats::verify_flac_file(
+            &part,
+            u16::from(t.channels),
+            t.rate,
+            u16::from(t.bits),
+            crc,
+        )?;
+        fs::rename(&part, out).map_err(|e| format!("{}: {e}", out.display()))?;
+        fs::metadata(out)
+            .map(|m| m.len())
+            .map_err(|e| format!("{}: {e}", out.display()))
+    });
+    match done {
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            Err(e)
+        }
+        ok => ok,
     }
 }
 
@@ -501,6 +587,15 @@ fn cmd_decode(
             (i, ext, dir.join(outname(&infos[i].name, ext)))
         })
         .collect();
+    let mut seen = std::collections::HashSet::new();
+    for &(i, _, ref path) in &outs {
+        if !v1::valid_name(&infos[i].name) {
+            return Err(format!("track {}: invalid name {:?}", i, infos[i].name));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(format!("{}: outputs collide", path.display()));
+        }
+    }
     if let Some((_, _, path)) = outs.iter().find(|(_, _, p)| p.exists()) {
         return Err(format!(
             "{} already exists, refusing to overwrite",
@@ -516,17 +611,8 @@ fn cmd_decode(
                     return stream_wav_out(&mut rd, i, t, range, threads, path)
                         .map(|n| (path.clone(), n));
                 }
-                // shortcut: FLAC export stays whole-track (flacenc works in
-                // memory anyway)
-                let (start, len) = range_bounds(t, range)?;
-                let s = if range.is_some() {
-                    rd.decode_range_par(i, start, len, threads)?
-                } else {
-                    rd.decode_track_par(i, threads)?
-                };
-                let bytes = export(t, &s, ext)?;
-                write_new(path, &bytes)?;
-                Ok((path.clone(), bytes.len() as u64))
+                stream_flac_out(&mut rd, i, t, range, threads, path)
+                    .map(|n| (path.clone(), n))
             })
             .collect()
     });
@@ -585,7 +671,10 @@ fn decode_opts(
                 } else {
                     Some(b_s.parse::<f64>().map_err(|_| USAGE.to_string())?)
                 };
-                if a_v < 0.0 || b_v.is_some_and(|b| b <= a_v) {
+                if !a_v.is_finite()
+                    || a_v < 0.0
+                    || b_v.is_some_and(|b| !b.is_finite() || b <= a_v)
+                {
                     return Err(USAGE.into());
                 }
                 range = Some((a_v, b_v));
@@ -603,12 +692,7 @@ fn decode_opts(
                 i += 1;
                 let names = only.get_or_insert_with(Vec::new);
                 let before = names.len();
-                while i < n
-                    && !matches!(
-                        a[i].as_str(),
-                        "-o" | "-j" | "--format" | "--only" | "--range"
-                    )
-                {
+                while i < n && !a[i].starts_with('-') {
                     names.push(a[i].clone());
                     i += 1;
                 }
@@ -674,7 +758,11 @@ fn source_samples(path: &str) -> Result<v1::dec::Samples, String> {
     }
 }
 
-/// `flq bench` — encode into memory, decode, compare with the sources.
+/// `flq bench` — encode into memory, verify by streaming decode (pcm_crc;
+/// no whole-track buffer on the decode side). Accuracy compares each
+/// source's canonical-PCM crc against the crc stored in the meta — the
+/// same end-to-end check as decoding the samples, at a fraction of the
+/// peak.
 fn cmd_bench(ins: &[String], opts: &v1::enc::V1Opts) -> Result<(), String> {
     let inputs = v1_inputs(ins)?;
     let (r, em) = measure(move || {
@@ -686,10 +774,10 @@ fn cmd_bench(ins: &[String], opts: &v1::enc::V1Opts) -> Result<(), String> {
     let (r, dm) = measure(|| {
         let mut rd = v1::dec::Reader::open(Cursor::new(&bytes))?;
         (0..rd.tracks().len())
-            .map(|t| rd.decode_track_par(t, dec_threads))
+            .map(|t| rd.verify_track_par(t, dec_threads))
             .collect::<Result<Vec<_>, _>>()
     });
-    let decoded = r?;
+    r?;
     let rd = v1::dec::Reader::open(Cursor::new(&bytes))?;
     print_stats(&stats, rd.tracks());
     println!(
@@ -705,7 +793,7 @@ fn cmd_bench(ins: &[String], opts: &v1::enc::V1Opts) -> Result<(), String> {
         .sum();
     print_metrics("Encode", &em, Some(audio));
     print_metrics("Decode", &dm, Some(audio));
-    println!("Accuracy (decoded vs source samples)");
+    println!("Accuracy (source canonical pcm vs stored pcm_crc)");
     let mut ok = true;
     for (i, p) in ins.iter().enumerate() {
         let name = Path::new(p)
@@ -713,13 +801,12 @@ fn cmd_bench(ins: &[String], opts: &v1::enc::V1Opts) -> Result<(), String> {
             .and_then(|n| n.to_str())
             .unwrap_or(p);
         let src = source_samples(p)?;
-        let same = match (&src, &decoded[i]) {
-            (v1::dec::Samples::Int(a), v1::dec::Samples::Int(b)) => a == b,
-            (v1::dec::Samples::Float(a), v1::dec::Samples::Float(b)) => a == b,
-            _ => false,
-        };
+        let t = &rd.tracks()[i];
+        let mut crc = v1::dec::Crc32::new();
+        crc.update(&v1::dec::samples_to_pcm(&src, t.bits));
+        let same = crc.finish() == t.pcm_crc;
         ok &= same;
-        let n: u64 = decoded[i].frames() as u64 * decoded[i].channels() as u64;
+        let n = t.frames * u64::from(t.channels);
         println!(
             "  {} {}: {}, {} samples identical",
             i + 1,
