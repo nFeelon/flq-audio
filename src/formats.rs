@@ -5,9 +5,7 @@ use std::io::Cursor;
 
 use symphonia::core::audio::{Audio, GenericAudioBufferRef};
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::{
-    AudioCodecParameters, AudioDecoderOptions, well_known,
-};
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions, well_known};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
@@ -16,7 +14,6 @@ use symphonia::core::meta::{MetadataOptions, StandardTag, Tag, Visual};
 use symphonia::default::{get_codecs, get_probe};
 
 use crate::aiff;
-use crate::mp3;
 use crate::wav;
 
 // ------------------------------------------------------------------ sniffing
@@ -28,16 +25,16 @@ pub enum Sniff {
     Aiff,
     Flac,
     /// MP4 family; carries the first audio sample-entry fourcc (`alac` ->
-    /// PCM path, `mp4a` etc. -> raw). `[0;4]` when the walk fails.
+    /// PCM path, anything else -> lossy). `[0;4]` when the walk fails.
     Mp4([u8; 4]),
-    Ogg(&'static str),
-    Aac,
-    Mp3,
+    /// Recognized lossy bitstream (mp3/aac/ogg family); the label is for
+    /// the rejection message — the payload is never parsed.
+    Lossy(&'static str),
     Unknown,
 }
 
 pub const UNSUPPORTED_MSG: &str =
-    "unsupported input (expected WAV, AIFF, FLAC, MP3, M4A (ALAC/AAC), AAC, Ogg Vorbis/Opus)";
+    "unsupported input (expected WAV, AIFF, FLAC or M4A (ALAC); flq is lossless only)";
 
 fn id3v2_skip(b: &[u8]) -> usize {
     if b.len() < 10 || !b.starts_with(b"ID3") {
@@ -59,10 +56,7 @@ fn id3v2_skip(b: &[u8]) -> usize {
 
 /// ADTS sync at `b`: 12-bit syncword, layer bits 00, sane sampling index.
 fn adts_at(b: &[u8]) -> bool {
-    b.len() >= 7
-        && b[0] == 0xFF
-        && (b[1] & 0xF6) == 0xF0
-        && (b[2] >> 2) & 0xF != 0xF
+    b.len() >= 7 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0 && (b[2] >> 2) & 0xF != 0xF
 }
 
 /// Find a child atom inside `b`; returns its payload range.
@@ -102,7 +96,9 @@ fn mp4_audio_entry(b: &[u8]) -> Option<[u8; 4]> {
     let mut first_any: Option<[u8; 4]> = None;
     let mut sound_entry: Option<[u8; 4]> = None;
     for_each(moov, b"trak", |trak| {
-        let Some(mdia) = find_atom(trak, b"mdia") else { return };
+        let Some(mdia) = find_atom(trak, b"mdia") else {
+            return;
+        };
         let entry = find_atom(mdia, b"minf")
             .and_then(|m| find_atom(m, b"stbl"))
             .and_then(|s| find_atom(s, b"stsd"))
@@ -119,8 +115,7 @@ fn mp4_audio_entry(b: &[u8]) -> Option<[u8; 4]> {
         if first_any.is_none() {
             first_any = Some(e);
         }
-        let soun = find_atom(mdia, b"hdlr")
-            .is_some_and(|h| h.len() >= 12 && &h[8..12] == b"soun");
+        let soun = find_atom(mdia, b"hdlr").is_some_and(|h| h.len() >= 12 && &h[8..12] == b"soun");
         if soun && sound_entry.is_none() {
             sound_entry = Some(e);
         }
@@ -147,7 +142,9 @@ fn for_each(b: &[u8], want: &[u8; 4], mut f: impl FnMut(&[u8])) {
         };
         let start = pos + hdr as usize;
         let end = start.saturating_add(body_len as usize);
-        if id == want && let Some(body) = b.get(start..end.min(b.len())) {
+        if id == want
+            && let Some(body) = b.get(start..end.min(b.len()))
+        {
             f(body);
         }
         if end <= pos {
@@ -191,22 +188,20 @@ pub fn sniff(b: &[u8]) -> Sniff {
         return Sniff::Mp4(mp4_audio_entry(b).unwrap_or([0; 4]));
     }
     if b.starts_with(b"OggS") {
-        return Sniff::Ogg(ogg_label(b));
+        return Sniff::Lossy(ogg_label(b));
     }
-    // ADTS must be checked before mp3::sniff (an ID3v2 prefix is claimed by it)
+    // ADTS must be checked before generic MPEG audio (both start 0xFF)
     if adts_at(&b[id3v2_skip(b)..]) {
-        return Sniff::Aac;
+        return Sniff::Lossy("aac");
     }
-    if mp3::sniff(b) || mpeg_audio_at(&b[id3v2_skip(b)..]) {
-        return Sniff::Mp3;
+    if mpeg_audio_at(&b[id3v2_skip(b)..]) {
+        return Sniff::Lossy("mp3");
     }
     Sniff::Unknown
 }
 
 /// Plausible MPEG audio frame header (any version/layer): sync, no reserved
-/// fields. MPEG-1 L3 detail is mp3::sniff's job; this only keeps other MPEG
-/// variants (MPEG-2/2.5, Layer I/II) on the raw path instead of erroring —
-/// mp3::parse stores them as a raw item regardless.
+/// fields. Lossy — encode rejects it; this check only labels the rejection.
 fn mpeg_audio_at(b: &[u8]) -> bool {
     b.len() >= 4
         && b[0] == 0xFF
@@ -233,7 +228,9 @@ fn alac_cookie_depth(p: &AudioCodecParameters) -> Option<u32> {
         return None;
     }
     // magic cookie: frameLength u32, compatibleVersion u8, bitDepth u8
-    p.extra_data.as_ref().and_then(|d| d.get(5).map(|&v| u32::from(v)))
+    p.extra_data
+        .as_ref()
+        .and_then(|d| d.get(5).map(|&v| u32::from(v)))
 }
 
 /// Probe + decode all packets of the first audio track. Any decode error is
@@ -430,23 +427,6 @@ fn symphonia_tag_blob(tags: &[Tag], visuals: &[Visual]) -> Vec<u8> {
     out
 }
 
-/// Probe only for metadata (no audio decode); used for the ALAC tag blob.
-fn symphonia_metadata(bytes: &[u8]) -> Result<(Vec<Tag>, Vec<Visual>), String> {
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-    let mut fmt = get_probe()
-        .probe(
-            &Hint::new(),
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .map_err(|e| format!("probe failed: {e}"))?;
-    Ok(match fmt.metadata().skip_to_latest() {
-        Some(rev) => (rev.media.tags.clone(), rev.media.visuals.clone()),
-        None => (Vec::new(), Vec::new()),
-    })
-}
-
 // ----------------------------------------------------------------- public io
 
 /// Decoded PCM plus the preserved tag blob.
@@ -503,7 +483,7 @@ pub fn read_m4a(bytes: &[u8]) -> Result<PcmSource, String> {
 pub type DecodedPcm = (u16, u32, u16, Vec<Vec<i64>>);
 
 /// Decode a file to integer PCM streams (WAV/AIFF/FLAC/ALAC-in-MP4).
-/// Used by bench accuracy checks and the FLAC-output verification.
+/// Used by the FLAC-output verification.
 pub fn decode_pcm(bytes: &[u8]) -> Result<DecodedPcm, String> {
     match sniff(bytes) {
         Sniff::Wav => {
@@ -524,19 +504,6 @@ pub fn decode_pcm(bytes: &[u8]) -> Result<DecodedPcm, String> {
             let s = symphonia_decode(bytes)?;
             Ok((s.channels, s.rate, s.bits, s.x))
         }
-    }
-}
-
-/// Expected tag blob for an input file (for comparing against an output's
-/// retained blocks). WAV/AIFF/raw formats have none.
-pub fn tag_blocks(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    match sniff(bytes) {
-        Sniff::Flac => Ok(flac_tag_blocks(bytes)),
-        Sniff::Mp4(_) => {
-            let (t, v) = symphonia_metadata(bytes)?;
-            Ok(symphonia_tag_blob(&t, &v))
-        }
-        _ => Ok(Vec::new()),
     }
 }
 
@@ -596,12 +563,7 @@ pub fn encode_flac(
             inter.push(c[f] as i32);
         }
     }
-    let src = flacenc::source::MemSource::from_samples(
-        &inter,
-        ch,
-        bits as usize,
-        rate as usize,
-    );
+    let src = flacenc::source::MemSource::from_samples(&inter, ch, bits as usize, rate as usize);
     let cfg = flacenc::config::Encoder::default()
         .into_verified()
         .map_err(|e| format!("flacenc config: {e:?}"))?;
@@ -656,6 +618,70 @@ pub fn encode_flac(
     Ok(out)
 }
 
+/// WAV header (RIFF + fmt + data tag/size) for a v1 export of `pcm_len`
+/// canonical PCM bytes. The caller appends the PCM bytes (and one pad byte
+/// when the count is odd). int tag 1 (8/16/24/32), float tag 3 (32/64);
+/// uses WAVE_FORMAT_EXTENSIBLE (with `mask` and the matching subformat
+/// GUID) when channels > 2 or a channel mask is set.
+pub fn wav_header_v1(
+    pcm_len: usize,
+    sample_fmt: u8,
+    bits: u8,
+    channels: u8,
+    rate: u32,
+    mask: u32,
+) -> Vec<u8> {
+    let subtag: u16 = if sample_fmt == 1 { 3 } else { 1 };
+    let align = u32::from(channels) * (u32::from(bits) / 8);
+    let mut fmt = Vec::new();
+    let extensible = channels > 2 || mask != 0;
+    fmt.extend(if extensible { 0xFFFEu16 } else { subtag }.to_le_bytes());
+    fmt.extend(u16::from(channels).to_le_bytes());
+    fmt.extend(rate.to_le_bytes());
+    fmt.extend((rate * align).to_le_bytes());
+    fmt.extend((align as u16).to_le_bytes());
+    fmt.extend(u16::from(bits).to_le_bytes());
+    if extensible {
+        fmt.extend(22u16.to_le_bytes()); // cbSize
+        fmt.extend(u16::from(bits).to_le_bytes()); // valid bits
+        fmt.extend(mask.to_le_bytes());
+        // KSDATAFORMAT_SUBTYPE_PCM/IEEE_FLOAT: {tag-0000-0010-8000-00aa00389b71}
+        fmt.extend(subtag.to_le_bytes());
+        fmt.extend([
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+        ]);
+    }
+    let mut body = b"WAVE".to_vec();
+    body.extend(b"fmt ");
+    body.extend((fmt.len() as u32).to_le_bytes());
+    body.extend(fmt);
+    body.extend(b"data");
+    body.extend((pcm_len as u32).to_le_bytes());
+    let mut out = b"RIFF".to_vec();
+    out.extend(((body.len() + pcm_len + (pcm_len & 1)) as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
+/// WAV writer for v1 export: int tag 1 (8/16/24/32), float tag 3 (32/64).
+/// Uses WAVE_FORMAT_EXTENSIBLE (with `mask` and the matching subformat GUID)
+/// when channels > 2 or a channel mask is set.
+pub fn make_wav_v1(
+    pcm: &[u8],
+    sample_fmt: u8,
+    bits: u8,
+    channels: u8,
+    rate: u32,
+    mask: u32,
+) -> Vec<u8> {
+    let mut out = wav_header_v1(pcm.len(), sample_fmt, bits, channels, rate, mask);
+    out.extend(pcm);
+    if pcm.len() % 2 == 1 {
+        out.push(0); // chunks are even-padded
+    }
+    out
+}
+
 /// Canonical PCM WAV (tag 1, 44-byte header).
 pub fn make_wav(x: &[Vec<i64>], bits: u16, channels: u16, rate: u32) -> Vec<u8> {
     let frames = x.first().map_or(0, |c| c.len());
@@ -683,6 +709,51 @@ pub fn make_wav(x: &[Vec<i64>], bits: u16, channels: u16, rate: u32) -> Vec<u8> 
 pub(crate) mod tests {
     use super::*;
     use crate::bits::BitWriter;
+    use std::f64::consts::PI;
+
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as f64 / u32::MAX as f64
+    }
+
+    /// Deterministic audio-like signal: LCG noise through a resonator.
+    fn resonator(seed: u64, rate: u32, frames: usize) -> Vec<i64> {
+        let f0 = 2000.0 + (seed % 4000) as f64;
+        let w = 2.0 * PI * f0 / rate as f64;
+        let r = 0.95f64;
+        let a1 = 2.0 * r * w.cos();
+        let a2 = -r * r;
+        let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        let (mut y1, mut y2) = (0.0, 0.0);
+        let mut out = Vec::with_capacity(frames);
+        let mut peak = 0f64;
+        for n in 0..frames {
+            let noise = (lcg(&mut rng) - 0.5) * 4000.0;
+            let y = a1 * y1 + a2 * y2 + noise;
+            y2 = y1;
+            y1 = y;
+            let env = 0.6 + 0.4 * (2.0 * PI * n as f64 / (0.7 * rate as f64)).sin();
+            let v = y * env;
+            peak = peak.max(v.abs());
+            out.push(v);
+        }
+        let sc = 8000.0 / peak.max(1.0);
+        out.iter().map(|&v| (v * sc).round() as i64).collect()
+    }
+
+    /// Stereo pair: ch1 = 0.7*ch0 + 0.3*independent.
+    pub(crate) fn stereo(seed: u64, rate: u32, frames: usize) -> Vec<Vec<i64>> {
+        let c0 = resonator(seed, rate, frames);
+        let ind = resonator(seed ^ 0x5EED5EED, rate, frames);
+        let c1 = c0
+            .iter()
+            .zip(&ind)
+            .map(|(&a, &b)| (0.7 * a as f64 + 0.3 * b as f64).round() as i64)
+            .collect();
+        vec![c0, c1]
+    }
 
     // ----------------------------------------------------- fixture builders
 
@@ -790,20 +861,68 @@ pub(crate) mod tests {
         if entry == b"alac" {
             se.extend(&alac_sub);
         }
-        let stsd = full(b"stsd", 0, &[1u32.to_be_bytes().as_slice(), &atom(entry, &se)].concat());
-        let stts = full(b"stts", 0, &[1u32.to_be_bytes().as_slice(), &1u32.to_be_bytes(), &frames.to_be_bytes()].concat());
-        let stsc = full(b"stsc", 0, &[1u32.to_be_bytes().as_slice(), &1u32.to_be_bytes(), &1u32.to_be_bytes(), &1u32.to_be_bytes()].concat());
-        let stsz = full(b"stsz", 0, &[0u32.to_be_bytes().as_slice(), &1u32.to_be_bytes(), &(packet.len() as u32).to_be_bytes()].concat());
+        let stsd = full(
+            b"stsd",
+            0,
+            &[1u32.to_be_bytes().as_slice(), &atom(entry, &se)].concat(),
+        );
+        let stts = full(
+            b"stts",
+            0,
+            &[
+                1u32.to_be_bytes().as_slice(),
+                &1u32.to_be_bytes(),
+                &frames.to_be_bytes(),
+            ]
+            .concat(),
+        );
+        let stsc = full(
+            b"stsc",
+            0,
+            &[
+                1u32.to_be_bytes().as_slice(),
+                &1u32.to_be_bytes(),
+                &1u32.to_be_bytes(),
+                &1u32.to_be_bytes(),
+            ]
+            .concat(),
+        );
+        let stsz = full(
+            b"stsz",
+            0,
+            &[
+                0u32.to_be_bytes().as_slice(),
+                &1u32.to_be_bytes(),
+                &(packet.len() as u32).to_be_bytes(),
+            ]
+            .concat(),
+        );
         let moov = |data_off: u32| -> Vec<u8> {
-            let stco = full(b"stco", 0, &[1u32.to_be_bytes().as_slice(), &data_off.to_be_bytes()].concat());
+            let stco = full(
+                b"stco",
+                0,
+                &[1u32.to_be_bytes().as_slice(), &data_off.to_be_bytes()].concat(),
+            );
             let stbl = atom(b"stbl", &[&stsd[..], &stts, &stsc, &stsz, &stco].concat());
             let smhd = full(b"smhd", 0, &[0u8; 4]);
             let minf = atom(b"minf", &[&smhd[..], &stbl].concat());
-            let hdlr = full(b"hdlr", 0, &[0u32.to_be_bytes().as_slice(), b"soun", &[0u8; 12]].concat());
+            let hdlr = full(
+                b"hdlr",
+                0,
+                &[0u32.to_be_bytes().as_slice(), b"soun", &[0u8; 12]].concat(),
+            );
             let mdhd = full(
                 b"mdhd",
                 0,
-                &[0u32.to_be_bytes().as_slice(), &0u32.to_be_bytes(), &rate.to_be_bytes(), &frames.to_be_bytes(), &0x55c4u16.to_be_bytes(), &0u16.to_be_bytes()].concat(),
+                &[
+                    0u32.to_be_bytes().as_slice(),
+                    &0u32.to_be_bytes(),
+                    &rate.to_be_bytes(),
+                    &frames.to_be_bytes(),
+                    &0x55c4u16.to_be_bytes(),
+                    &0u16.to_be_bytes(),
+                ]
+                .concat(),
             );
             let mdia = atom(b"mdia", &[&mdhd[..], &hdlr, &minf].concat());
             let matrix: Vec<u8> = [0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000]
@@ -813,17 +932,44 @@ pub(crate) mod tests {
             let tkhd = full(
                 b"tkhd",
                 0x0000_0007,
-                &[&[0u8; 8][..], &1u32.to_be_bytes(), &[0u8; 4], &frames.to_be_bytes(), &[0u8; 8], &[0u8; 4], &0x0100u16.to_be_bytes(), &[0u8; 2], &matrix, &0u32.to_be_bytes(), &0u32.to_be_bytes()].concat(),
+                &[
+                    &[0u8; 8][..],
+                    &1u32.to_be_bytes(),
+                    &[0u8; 4],
+                    &frames.to_be_bytes(),
+                    &[0u8; 8],
+                    &[0u8; 4],
+                    &0x0100u16.to_be_bytes(),
+                    &[0u8; 2],
+                    &matrix,
+                    &0u32.to_be_bytes(),
+                    &0u32.to_be_bytes(),
+                ]
+                .concat(),
             );
             let trak = atom(b"trak", &[&tkhd[..], &mdia].concat());
             let mvhd = full(
                 b"mvhd",
                 0,
-                &[&[0u8; 8][..], &rate.to_be_bytes(), &frames.to_be_bytes(), &0x0001_0000u32.to_be_bytes(), &0x0100u16.to_be_bytes(), &[0u8; 10], &matrix, &[0u8; 24], &2u32.to_be_bytes()].concat(),
+                &[
+                    &[0u8; 8][..],
+                    &rate.to_be_bytes(),
+                    &frames.to_be_bytes(),
+                    &0x0001_0000u32.to_be_bytes(),
+                    &0x0100u16.to_be_bytes(),
+                    &[0u8; 10],
+                    &matrix,
+                    &[0u8; 24],
+                    &2u32.to_be_bytes(),
+                ]
+                .concat(),
             );
             atom(b"moov", &[&mvhd[..], &trak].concat())
         };
-        let ftyp = atom(b"ftyp", &[b"M4A ".as_slice(), &0u32.to_be_bytes(), b"M4A ", b"isom"].concat());
+        let ftyp = atom(
+            b"ftyp",
+            &[b"M4A ".as_slice(), &0u32.to_be_bytes(), b"M4A ", b"isom"].concat(),
+        );
         let m0 = moov(0);
         let data_off = (ftyp.len() + m0.len() + 8) as u32;
         let moov = moov(data_off);
@@ -836,14 +982,12 @@ pub(crate) mod tests {
     fn flac_decode_and_tags() {
         let rate = 44100;
         for (bits, ch) in [(16u16, 2usize), (24, 2), (8, 1)] {
-            let sig = crate::container::tests::stereo(31, rate, 3000);
+            let sig = stereo(31, rate, 3000);
             let x: Vec<Vec<i64>> = (0..ch)
                 .map(|c| {
                     sig[c % 2]
                         .iter()
-                        .map(|&v| {
-                            v.clamp(-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
-                        })
+                        .map(|&v| v.clamp(-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1))
                         .collect()
                 })
                 .collect();
@@ -861,7 +1005,7 @@ pub(crate) mod tests {
     #[test]
     fn alac_decode() {
         let rate = 44100;
-        let sig = crate::container::tests::stereo(17, rate, 2000);
+        let sig = stereo(17, rate, 2000);
         let m4a = mp4_fixture(&sig, 16, rate, b"alac");
         assert_eq!(sniff(&m4a), Sniff::Mp4(*b"alac"));
         let s = read_m4a(&m4a).unwrap();
@@ -876,7 +1020,7 @@ pub(crate) mod tests {
 
     #[test]
     fn mp4_mp4a_sniff() {
-        let sig = crate::container::tests::stereo(7, 44100, 100);
+        let sig = stereo(7, 44100, 100);
         let mp4 = mp4_fixture(&sig, 16, 44100, b"mp4a");
         assert_eq!(sniff(&mp4), Sniff::Mp4(*b"mp4a"));
     }
@@ -896,11 +1040,11 @@ pub(crate) mod tests {
             h
         };
         let adts = frame(&[0x55; 100]);
-        assert_eq!(sniff(&adts), Sniff::Aac);
+        assert_eq!(sniff(&adts), Sniff::Lossy("aac"));
         // with ID3v2 prefix
         let mut tagged = b"ID3\x04\x00\x00\x00\x00\x00\x05abcde".to_vec();
         tagged.extend(&adts);
-        assert_eq!(sniff(&tagged), Sniff::Aac);
+        assert_eq!(sniff(&tagged), Sniff::Lossy("aac"));
         // ogg page with OpusHead payload
         let ogg = |payload: &[u8]| -> Vec<u8> {
             assert!(payload.len() < 255);
@@ -915,11 +1059,11 @@ pub(crate) mod tests {
         };
         let mut p = b"OpusHead".to_vec();
         p.extend([1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(sniff(&ogg(&p)), Sniff::Ogg("ogg opus"));
+        assert_eq!(sniff(&ogg(&p)), Sniff::Lossy("ogg opus"));
         let mut p = vec![1u8];
         p.extend(b"vorbis");
-        assert_eq!(sniff(&ogg(&p)), Sniff::Ogg("ogg vorbis"));
-        assert_eq!(sniff(&ogg(b"randomstuff")), Sniff::Ogg("ogg"));
+        assert_eq!(sniff(&ogg(&p)), Sniff::Lossy("ogg vorbis"));
+        assert_eq!(sniff(&ogg(b"randomstuff")), Sniff::Lossy("ogg"));
         assert_eq!(sniff(b"garbage"), Sniff::Unknown);
     }
 }

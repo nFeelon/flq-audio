@@ -20,6 +20,8 @@ pub struct Fmt {
     pub rate: u32,
     pub bits: u16,
     pub block_align: u16,
+    /// WAVE dwChannelMask from an extensible fmt chunk (0 = unspecified).
+    pub channel_mask: u32,
 }
 
 fn u16le(b: &[u8], at: usize) -> u16 {
@@ -47,23 +49,34 @@ fn scan(bytes: &[u8]) -> Result<(Fmt, usize, u32), String> {
                 return Err("malformed fmt chunk".into());
             }
             let mut tag = u16le(bytes, dstart);
+            let mut channel_mask = 0u32;
             if tag == 0xFFFE {
                 if size < 40 || dstart + 40 > bytes.len() {
                     return Err("malformed extensible fmt chunk".into());
                 }
+                channel_mask = u32le(bytes, dstart + 20);
                 tag = u16le(bytes, dstart + 24); // subformat GUID tag
             }
             let channels = u16le(bytes, dstart + 2);
             let rate = u32le(bytes, dstart + 4);
             let block_align = u16le(bytes, dstart + 12);
             let bits = u16le(bytes, dstart + 14);
-            fmt = Some(Fmt { tag, channels, rate, bits, block_align });
+            fmt = Some(Fmt {
+                tag,
+                channels,
+                rate,
+                bits,
+                block_align,
+                channel_mask,
+            });
         } else if id == b"data" {
             let f = fmt.ok_or("data chunk precedes fmt")?;
             return Ok((f, pos, size));
         }
         // chunks are padded to even sizes
-        let next = dstart.saturating_add(size as usize).saturating_add((size & 1) as usize);
+        let next = dstart
+            .saturating_add(size as usize)
+            .saturating_add((size & 1) as usize);
         if next <= pos {
             break;
         }
@@ -114,6 +127,16 @@ pub fn parse(bytes: &[u8]) -> Result<Wav, String> {
         pcm: bytes[pcm_start..pcm_start + pcm_len].to_vec(),
         suffix: bytes[pcm_start + pcm_len..].to_vec(),
     })
+}
+
+/// Header-only scan for streaming encoders: returns the parsed fmt (with
+/// channel_mask), the file offset of the first PCM byte, and the declared
+/// `data` size. `bytes` must cover the header (everything up to `data`'s
+/// payload); a longer file tail is not needed.
+pub fn scan_prefix(bytes: &[u8]) -> Result<(Fmt, usize, u32), String> {
+    let (f, data_pos, size) = scan(bytes)?;
+    check_fmt(&f)?;
+    Ok((f, data_pos + 8, size))
 }
 
 /// Recover the fmt from a stored prefix (ends exactly after the `data` header).
@@ -210,7 +233,7 @@ pub fn words_to_pcm(words: &[Vec<u64>], bits: u16, frames: usize) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// fmt chunk payload (16 bytes).
@@ -301,7 +324,10 @@ mod tests {
         assert_eq!(p.frames, 3);
         assert_eq!(&p.prefix[..4], b"RIFF");
         assert!(p.prefix.ends_with(b"data\x03\x00\x00\x00"));
-        assert!(p.suffix.starts_with(&[0][..]) || p.suffix.starts_with(b"JUNK"), "suffix = pad + JUNK");
+        assert!(
+            p.suffix.starts_with(&[0][..]) || p.suffix.starts_with(b"JUNK"),
+            "suffix = pad + JUNK"
+        );
         assert!(p.suffix.windows(4).any(|s| s == b"JUNK"));
         let mut rebuilt = p.prefix.clone();
         rebuilt.extend(&p.pcm);
@@ -362,7 +388,13 @@ mod tests {
         assert!(parse(b"not a wav").is_err());
         assert!(parse(&riff(&[(b"data", vec![0u8; 8])])).is_err()); // no fmt
         // ADPCM tag 2
-        assert!(parse(&riff(&[(b"fmt ", fmt_chunk(2, 1, 8000, 4)), (b"data", vec![0u8; 4])])).is_err());
+        assert!(
+            parse(&riff(&[
+                (b"fmt ", fmt_chunk(2, 1, 8000, 4)),
+                (b"data", vec![0u8; 4])
+            ]))
+            .is_err()
+        );
         // missing data
         assert!(parse(&riff(&[(b"fmt ", fmt_chunk(1, 1, 8000, 8))])).is_err());
     }

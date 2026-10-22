@@ -1,4 +1,4 @@
-![FLQ — lossless audio container](docs/assets/banner.png)
+![FLQ — lossless audio format](docs/assets/banner.png)
 
 # FLQ — Filon Lossless Quality
 
@@ -7,168 +7,109 @@
 ![status](https://img.shields.io/badge/status-experimental-orange.svg)
 ![rust](https://img.shields.io/badge/rust-edition_2024-red.svg)
 
-A lossless audio **container + codec** that packs multiple tracks into a
-single `.flq` bundle — with cross-track compression for related audio.
-
-FLQ looks for repeated low-level audio content **within** a track and
-**across** related tracks. When a block can be represented more efficiently
-using an earlier block as a reference, FLQ stores only the residual instead
-of encoding the block independently.
-
-| Guarantee | What it means |
-|---|---|
-| **Byte-exact** | WAV, AIFF and MP3 tracks come back bit-for-bit identical |
-| **Sample-exact** | FLAC/ALAC tracks decode to identical PCM samples; supported metadata is preserved where representable; the file itself is re-encoded |
-| **Adaptive** | coding method is chosen per block; anything not beneficial falls back to plain storage |
+FLQ is a lossless audio format for multi-track material: up to 255 tracks
+(e.g. stems) coded as independent, CRC-checked frames of 16384 samples.
+Every frame decodes on its own, so a player can jump anywhere, extract a
+single stem, or keep going past a damaged frame — and a decoder needs
+O(frame) memory. Inputs are WAV, AIFF/AIFF-C, FLAC and ALAC; samples are
+kept exactly, and FLAC/ALAC tag blocks ride along. The bitstream is
+specified in [`docs/SPEC-v1.md`](docs/SPEC-v1.md) with conformance vectors
+in [`testdata/v1/`](testdata/v1/).
 
 **Benchmark headline.** On a common 47-file subset accepted by every
-compared tool, FLQ produced 50.5% of the source size, compared with
-51.2% for FLAC -8 and 52.0% for WavPack -hx.
+compared tool, `flq encode` produced 50.9% of the source size, compared
+with 51.2% for FLAC -8 and 52.0% for WavPack -hx — smaller files than
+FLAC on 43/47 inputs and than WavPack on 31/47. Monkey's Audio (50.85%,
+smaller than FLQ on 29/47), TAK and OptimFROG compress further.
 
-FLQ produced smaller files on 44/47 inputs than FLAC and 36/47 than
-WavPack. TAK and OptimFROG achieved smaller aggregate output sizes.
-
-These results compare compression ratio, not overall performance: FLQ
-encoding was approximately 4–80× slower than the reference codecs in
-the tested configurations.
+These results compare compression ratio, not overall performance: at
+equal thread count FLQ's LPC/Rice path encodes ~8–9× slower than FLAC -8
+(8.8 vs 67.6 MiB/s on 1 thread, 30.8 vs 285.7 MiB/s on 8).
 
 [Full comparison and methodology](#vs-reference-codecs).
 
 ## Quick start
 
 ```console
-cargo run --release -- encode drums1.wav drums2.wav theme.flac bundle.flq
-cargo run --release -- decode bundle.flq -o restored/
-cargo run --release -- decode bundle.flq --only drums2.wav   # extract one track
-cargo run --release -- bench a.wav b.mp3                     # dry run: sizes, gain, timing
+cargo run --release -- encode drums.wav pad.flac stems.flq            # encode
+cargo run --release -- decode stems.flq -o out/                       # all tracks
+cargo run --release -- decode stems.flq --only pad.flac --range 30:45 # one stem, 15 s
+cargo run --release -- info stems.flq
+cargo run --release -- bench drums.wav pad.flac                       # encode+decode in memory
 ```
 
 Requires Rust 1.85+ (edition 2024). The release binary lands at
-`target/release/flq` — it is not added to PATH.
+`target/release/flq` — it is not added to PATH. Prebuilt binaries are
+attached to [GitHub releases](https://github.com/nFeelon/flq-audio/releases).
+Try it in the browser: [`web/`](web/) is a WASM player (mute/solo per
+stem, seek, WAV export) — see [`web/README.md`](web/README.md).
 
-Accepted inputs: `.wav` `.aiff/.aif/.aifc` `.flac` `.mp3` `.m4a/.mp4`
-(ALAC or AAC) `.aac` `.ogg` (Vorbis/Opus). Up to 255 tracks per file.
-No codec-tuning flags — encoding decisions are adaptive; `encode`/`bench`
-take `--no-joint` to skip reference analysis (used for the ablation below);
-`decode` adds only `--format flac|wav` for FLAC/ALAC tracks and `--only`
-for subset extraction.
+Options. `encode`: `-0`/`-5`/`-8` (LPC search depth; default `-5`, within
+0.01 pp of exhaustive `-8`), `-j N` (threads; default all cores),
+`--frame N` (frame length, multiple of 4096), `--no-index`. `decode`:
+`--only name…`, `--range a:b` (seconds), `--format wav|flac`
+(default: the source's family). `bench` measures encode+decode in memory.
+Every command refuses to overwrite existing files.
 
 ## What each format becomes
 
-| Input | Inside `.flq` | You get back | Guarantee |
-|---|---|---|---|
-| WAV | FLQ PCM (joint LPC + Rice) | the original file | byte-exact |
-| AIFF / AIFF-C | FLQ PCM | the original file | byte-exact |
-| FLAC | FLQ PCM + tag blob | re-encoded FLAC (or WAV) | sample-exact |
-| ALAC (`.m4a`) | FLQ PCM + tag blob | FLAC (or WAV) | sample-exact |
-| MP3 (MPEG-1 L3) | range-coded structure | the original file | byte-exact |
-| MP3 (other), AAC, ADTS, Ogg Vorbis/Opus | stored as-is | the original file | byte-exact |
+Samples are kept exactly; the input file container is not (a WAV comes
+back as a WAV with identical audio bytes, not necessarily identical
+headers; a FLAC comes back re-encoded with its tag blocks preserved).
 
-Per block and per track the encoder rejects any representation that isn't
-smaller than its alternatives — so no track pays for an encoding that didn't
-help. The container adds only a small deflated metadata record per track
-(measured ~30 KB total across a 668 MiB / 47-file set), so a bundle of
-unrelated, already-incompressible files can end up slightly larger than
-the inputs.
+| Input | Stored as | `decode` gives (default) | Guarantee |
+|---|---|---|---|
+| WAV (int 8/16/24/32, float 32/64, extensible) | framed LPC/Rice | WAV | sample-exact |
+| AIFF / AIFF-C | framed LPC/Rice | WAV | sample-exact |
+| FLAC | framed LPC/Rice + tag blocks | FLAC (or WAV) | sample-exact + tags |
+| ALAC (`.m4a`) | framed LPC/Rice + tags | FLAC (or WAV) | sample-exact + tags |
+| MP3, AAC, Ogg | rejected — flq is lossless | | |
 
 ## How it works
 
-```mermaid
-flowchart LR
-    subgraph inputs["input files (≤255 tracks)"]
-        W["WAV / AIFF"]
-        F["FLAC / ALAC"]
-        M["MP3"]
-        L["AAC / Ogg"]
-    end
-    W --> P["PCM pipeline<br/>float-split · stereo modes<br/>LPC · partitioned Rice"]
-    F -->|"symphonia decode"| P
-    P --> R{"shared blocks?<br/>self + ≤4 earlier tracks<br/>per-block byte cost"}
-    M --> Q{"MPEG-1 L3?"}
-    Q -->|yes| RC["context-modeled<br/>range coder<br/>(fresh or chained model)"]
-    Q -->|no| S["stored raw"]
-    L --> S
-    R --> C["v3 container<br/>header · deflate meta · payloads"]
-    RC --> C
-    S --> C
-    C --> O["file.flq"]
-```
-
-**Shared blocks.** Audio is split into 4096-sample blocks (~93 ms). A block
-coded by reference stores `source track · lag · gain` plus a residual —
-the earlier material is used as the predictor, the difference is still coded.
-A reference wins a block only when it is strictly fewer bits, which is why
-merely-correlated noise (high NCC, unpredictable) is correctly declined.
-
-```mermaid
-flowchart TB
-    subgraph ta["track A — encoded earlier"]
-        a1["block n:<br/>kick drum"]
-    end
-    subgraph tb["track B — encoded later"]
-        b0["block m−3:<br/>kick drum"]
-        b1["block m =<br/>ref → A.n · gain · residual"]
-        b2["block m′ =<br/>self → B.m−3 · gain · residual"]
-    end
-    a1 -.-> b1
-    b0 -.-> b2
-```
-
-Sources: earlier blocks in the current track, plus **up to four screened
-earlier PCM tracks** at the same sample rate — drum-loop stems reuse
-themselves heavily. MP3 tracks instead chain the range coder's adaptive
-statistics (mode 2). All track metas deflate together.
-
-**Container layout (v3):**
-
 ```text
-"FLQ1" | version u8 | ntracks u8 | block u32
-meta_mode u8 | meta_raw_len u32 | meta_len u32 | meta (deflate if smaller)
-payload[0] | payload[1] | ... | payload[n-1]        (lengths live in metas)
+header 28 B   "FLQ1" | 1 | flags | ntracks | frame_len | meta_len | index_off | crc
+meta          per track: name, origin, rate, channels, mask, format, frames, pcm_crc, tags
+frames        t0f0 t1f0 t0f1 t1f1 …   each: "FQ" | track | fmode | e | frame_no | n | len | payload | crc32
+index         per track: frame offsets (u64) + crc32          (optional; frames resync without it)
 ```
 
-v1/v2 files still decode. Details: [`src/container.rs`](src/container.rs)
-doc comment, [`AGENTS.md`](AGENTS.md).
+A frame payload is the codec applied to `frame_len` samples (default
+16384): 4096-sample blocks, per block a stereo mode (L/R, L/S, R/S, M/S),
+per signal LPC up to order 32 with 15-bit coefficients and a partitioned
+Rice residual; float tracks split into an integer significand stream plus
+exact tail bits. History resets at every frame start; the first `order`
+samples are stored verbatim, which keeps the frame cost at +0.10 pp over
+continuous coding. Seeking reads the index, decodes one frame and trims.
+Decoding streams frame by frame (0.6 MiB heap for a 77 MB WAV); encoding
+streams WAV/AIFF input and codes frames in parallel. There are no
+cross-track references anywhere in the codec or the wire format.
 
 ## Measured results
 
-Corpus: 256 files, 2236.2 MiB in → **1504.1 MiB packed (67.3%), −732.1 MiB** —
-all 256 passed their format-specific round-trip checks: byte-exact where
-supported, sample-exact for FLAC/ALAC. Sweep @ `1856cdf`; pair/group rows
-@ `a4b1e34`.
-Dated reports: [`testdata/results/`](testdata/results/).
+Dated reports: [`testdata/results/`](testdata/results/). Corpus: a
+Freesound-derived sample pack (not redistributed).
+
+### 148 WAV/AIFF files, 1572 MiB
+
+| | Result |
+|---|---|
+| Accepted / verified | 148/148 — decoded WAV data chunks byte-identical (AIFF: pcm_crc) |
+| Output | 55.75% of source (median 58.0%) |
+| Encode / decode | 51.6 MiB/s on 24 threads (process-level, incl. small files) / single-threaded streaming |
+| Peak heap | encode ≤ 53 MiB, decode ≤ 0.8 MiB (77 MB WAV: 28 MiB / 0.6 MiB) |
+| Seek | 0.1 s anywhere in a 400 s file: 9–23 ms wall, process start included |
+
+Frame-reset cost on the 47-file set vs continuous coding: +0.41 pp at
+4096-sample frames, +0.20 pp at 8192, **+0.10 pp at 16384 (default)**,
++0.05 pp at 32768. Details:
+[`2026-10-22_9f25157.md`](testdata/results/2026-10-22_9f25157.md).
+
+Earlier single-file measurements by input format (WAV int 54.6%,
+WAV float 53.2%, AIFF f32 77.9%, FLAC → PCM ~98% of source) live in
+[`testdata/results/`](testdata/results/):
 
 ![FLQ size as % of source by format — single-file encode](docs/assets/compression-by-format.svg)
-
-| Case | Result |
-|---|---|
-| WAV int / float | 54.6% / 53.2% of source |
-| MP3 MPEG-1 L3 (modeled, 59 files) | 84.3% avg / 83.6% median / 76.3% best |
-| FLAC → PCM | ~98% (near parity with FLAC) |
-| AAC / Ogg / stored raw | ≈100% payload size, plus container metadata |
-
-Bundling related files adds further savings on top of single-file packing.
-Groups below are freesound.org **author packs** — files uploaded by one
-creator (looplicator, timbre, klankbeeld…) tend to share sources, so they
-compress together:
-
-![extra saving of one bundle vs the sum of separately encoded .flq files](docs/assets/bundle-vs-singles.svg)
-
-### Real run
-
-Two layered sound-design stems from the corpus (file names shortened):
-
-```text
-$ flq bench *_top-impact.wav *spell-design-1.wav
-  1 …_top-impact.wav      1,033,476 B   wav f32 2ch 44100 Hz
-  2 …_spell-design-1.wav  1,078,324 B   wav f32 2ch 44100 Hz
-Output .flq               1,196,490 B   ratio 1.765x   (56.66% of inputs)
-  2 …spell-design-1.wav: on - track 1 in 21/33 blocks, max NCC 0.656
-bundle: references saved 160,976 B (7.62% of input)
-Encode  wall 0.490 s   peak heap 46.2 MiB   speed 12.2x realtime
-Decode  wall 0.026 s   peak heap 14.3 MiB   speed 231.7x realtime
-Accuracy: both tracks bit-exact
-```
 
 ### vs reference codecs
 
@@ -179,8 +120,8 @@ Same corpus, same files, single-file encode, verified decode. On the
 |---|---|
 | OptimFROG extranew-light | 48.4% |
 | TAK -p4m | 49.9% |
-| **FLQ** | **50.5%** |
-| Monkey's Audio -c4000 | 50.9% |
+| Monkey's Audio -c4000 | 50.85% |
+| **FLQ `encode` (default)** | **50.87%** |
 | FLAC -8 | 51.2% |
 | WavPack -hx | 52.0% |
 | 7-Zip LZMA2 -mx9 | 64.6% |
@@ -191,48 +132,42 @@ Same corpus, same files, single-file encode, verified decode. On the
 Aggregate percentages hide the per-file picture, so here are the
 pairwise counts — a "win" means FLQ's file is smaller on that input:
 
-| FLQ vs | wins /47 | losses | median delta |
-|---|---|---|---|
-| FLAC | 44 | 3 | +0.66 pp |
-| WavPack | 36 | 11 | +1.09 pp |
-| Monkey's Audio | 24 | 23 | +0.01 pp |
-| TAK | 9 | 38 | −0.55 pp |
-| OptimFROG | 5 | 42 | −1.59 pp |
-| 7-Zip | 41 | 6 | +14.26 pp |
-| Zstd | 44 | 3 | +25.86 pp |
+| FLQ vs | wins / losses | median delta |
+|---|---|---|
+| FLAC | 43 / 4 | +0.30 pp |
+| WavPack | 31 / 16 | +0.98 pp |
+| Monkey's Audio | 18 / 29 | −0.42 pp |
+| TAK | 3 / 44 | −0.90 pp |
+| OptimFROG | 1 / 46 | −1.99 pp |
+| 7-Zip | 40 / 7 | +12.13 pp |
+| Zstd | 43 / 4 | +25.65 pp |
 
 Delta = reference codec size (% of source) − FLQ size (% of source).
 Positive values mean FLQ produced smaller files.
 
-The FLAC and WavPack leads are consistent across files; APE is a
-near-tie in per-file results on this subset (24 wins, 23 losses;
-+0.01 pp median difference); OptimFROG and TAK stay ahead.
+FLQ's lead over FLAC and WavPack is consistent across files; Monkey's
+Audio is slightly ahead of it; OptimFROG and TAK stay ahead of all three.
 
 #### ablation: which stage earns it
 
-`flq encode --no-joint` skips reference analysis entirely, and the
-encoder stats expose each pipeline stage. Payload bytes, same 47 files:
+Payload bytes, same 47 files:
 
 | Pipeline stage | % of source | per-file vs FLAC |
 |---|---|---|
 | per-channel LPC/Rice | 50.95% | 32 win / 15 loss |
 | + stereo decorrelation | 50.77% | — |
-| + self/cross references (full FLQ) | 50.51% | 44 win / 3 loss |
+| + independent 16384-sample frames | 50.87% | 43 win / 4 loss |
 
 So the LPC/Rice core alone is already at/below FLAC's file-level size;
-stereo modes and references add ~0.4 pp on single unrelated files
-(references earn much more on related multi-track bundles — see the
-bundle chart above). This is a codec comparison, not a container trick:
-non-audio bytes per output are 30,454 B for FLQ (0.004%) vs 402,798 B
-for FLAC (0.06%) and 1,002,926 B for WavPack (0.14%), summed over the
-same files.
+stereo modes add ~0.2 pp, and independent frames give back 0.10 pp. This
+is a codec comparison, not a container trick.
 
 Its edge is coverage: FLAC rejected 69/148 corpus files (float WAV,
-AIFF, odd headers), OptimFROG 69, TAK 94, while FLQ, WavPack and APE
-took all 148 — plus joint cross-track coding none of the reference
-codecs have. The honest cost: encode is ~4–80× slower than the
-reference codecs (the joint analysis pass is ~2/3 of that — 458 s vs
-153 s for the subset); decode stays fast (~0.2 s/file). PAQ8PX is the
+AIFF, odd headers), OptimFROG 69, TAK 94, while FLQ, WavPack and APE took
+all 148. The honest cost is encode speed: at equal threads the LPC/Rice
+path is ~8–9× slower than FLAC -8; decode stays fast (~0.2 s/file).
+Speed measurements and presets:
+[`2026-10-22_9f25157.md`](testdata/results/2026-10-22_9f25157.md). PAQ8PX is the
 theoretical extreme, not a practical one (~61% at ~2,000× FLAC's encode
 time). Full method, settings, per-format tables and the ablation:
 [`2026-10-22_e254a5b.md`](testdata/results/2026-10-22_e254a5b.md)
@@ -241,50 +176,56 @@ time). Full method, settings, per-format tables and the ablation:
 
 | Path | Role |
 |---|---|
-| `src/codec.rs` | float split, stereo modes, LPC, block plan/write/read |
-| `src/joint.rs` | FFT/NCC analysis, reference candidate screening |
+| `src/v1/` | the format: header/meta/frame/index (`mod.rs`), streaming encoder (`enc.rs`), `Reader` with seek, range decode, resync (`dec.rs`) |
+| `src/codec.rs` | float split, stereo modes, LPC (presets, warm-up), block plan/write/read |
 | `src/bits.rs` | MSB-first bit IO, partitioned Rice + escape, CRC32 |
-| `src/container.rs` | wire format, encode/decode/subset, stats |
-| `src/formats.rs` | sniffing, FLAC/ALAC decode, tag blobs, FLAC output |
-| `src/wav.rs` · `src/aiff.rs` | byte-exact container parsing/write-back |
-| `src/mp3/` | MPEG-1 L3 parser, Huffman codec, adaptive range coder |
+| `src/formats.rs` | sniffing, FLAC/ALAC decode, tag blobs, FLAC/WAV output |
+| `src/wav.rs` · `src/aiff.rs` | container parsing (whole-file and header-only) and write-back |
 | `src/main.rs` | CLI + timing/heap metrics |
+| `wasm/` · `web/` | dependency-free WASM decoder exports + browser player |
+| `fuzz/` | cargo-fuzz target for the v1 reader |
 
-Deeper architecture + wire-format spec: [`AGENTS.md`](AGENTS.md).
+Bitstream spec: [`docs/SPEC-v1.md`](docs/SPEC-v1.md). Architecture and
+contributor notes: [`AGENTS.md`](AGENTS.md).
 
 ## Limitations
 
-**Memory.** Whole-file-in-memory codec — encode peak ≈ 20× input size
-(~1.9 GiB heap on a 76 MiB bundle). No streaming.
+**Memory.** Decode keeps one frame (< 1 MiB); encode reads WAV/AIFF
+frame by frame, but FLAC/ALAC inputs are still decoded whole into
+memory first.
 
-**Format coverage.** MP3 modeling is MPEG-1 Layer III only — MPEG-2/2.5,
-Layer I/II, free-format → raw. FLAC/ALAC tracks are re-encoded on output:
-samples and tags preserved, original file bytes are not. ALAC comes out as
-FLAC; SEEKTABLE/PADDING not preserved; `--format wav` drops tags. PCM kind:
-8/16/24-bit only.
+**Format coverage.** Integer 8/16/24/32-bit, float 32/64-bit, 1–16
+channels; lossy inputs (MP3, AAC, Ogg) are refused — flq is lossless
+only. WAV output drops tags; FLAC output can't hold float or 32-bit int;
+FLAC/ALAC are re-encoded on output (samples and tags preserved, original
+bytes not); ALAC comes out as FLAC; SEEKTABLE/PADDING not preserved.
 
-**Structure.** 255 tracks max per `.flq`. Cross-references and MP3 mode-2
-chains are sequential decode dependencies — extracting one track
-(`--only`) still resolves its reference closure, and one bundle is one
-failure domain.
+**Structure.** 255 tracks max per `.flq`. Frames are independent — a
+corrupt frame costs at most that frame, and only on its own track.
 
-**Status.** Experimental, pre-1.0. v1/v2 containers keep decoding; v3 is
-the current write format. Benchmarks above were measured at commits
-`1856cdf` / `a4b1e34`.
+**Speed.** Encoding is roughly an order of magnitude slower than FLAC at
+equal thread count; decoding is single-threaded.
+
+**Status.** Experimental tool. The v1.0 bitstream is frozen by the spec
+and conformance vectors. Results from one corpus — not yet checked on a
+second collection (e.g. music masters).
 
 ## Development
 
 ```console
-cargo test --release                # 98 tests
-cargo test --release -- --ignored   # + real-file fixture tests (testdata/)
+cargo test --release                # unit + conformance + mutation tests
+cargo test --release -- --ignored   # + vector/demo generators
 cargo clippy --release --all-targets
 ```
 
-CI: GitHub Actions (`.github/workflows/ci.yml`) — build, tests and clippy
-on Ubuntu and Windows.
+CI: GitHub Actions — `ci.yml` (build, tests and clippy on Ubuntu and
+Windows; 60 s cargo-fuzz run on nightly), `release.yml` (binaries for
+Linux/Windows/macOS on `v*` tags), `pages.yml` (builds the WASM player
+and deploys `web/` to GitHub Pages).
 
 - [`AGENTS.md`](AGENTS.md) — invariants, wire format, contributor notes
-- [`testdata/`](testdata/) — tracked fixtures + dated measurement reports
+- [`testdata/`](testdata/) — tracked fixtures, v1 conformance vectors,
+  dated measurement reports
 - [`docs/make_assets.py`](docs/make_assets.py) — regenerates the banner
   and charts above
 

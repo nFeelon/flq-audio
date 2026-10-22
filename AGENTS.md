@@ -1,19 +1,52 @@
 # flq
 
-FLQ lossless audio codec (Rust library + CLI). Container v2 holds WAV, AIFF and decoded-PCM tracks (joint LPC codec, v1-compatible decoding), MP3 tracks and raw stored tracks. MP3 mode 0 = stored raw; mode 1 = "modeled" — context-modeled range-coded recompression of the parsed structure, verified byte-exact on encode (falls back to mode 0 when not smaller or not exact); mode 2 = modeled chained into the adaptive model carried across MP3 tracks (v3 only — payload identical in form, model pre-seeded by earlier tracks). AIFF/AIFF-C is byte-exact like WAV (prefix/PCM/suffix + whole-file CRC). FLAC and ALAC (`.m4a`) decode to PCM (kind 3, tags blob preserved; stored raw instead when FLQ PCM is not smaller) and decode out as FLAC or WAV (`--format`). AAC/M4A-AAC, ADTS `.aac` and Ogg (Vorbis/Opus) are stored as-is (kind 4, byte-exact). Unknown input is rejected. Shell is PowerShell; cargo's stderr shows up as a harmless `NativeCommandError`.
+FLQ lossless audio (Rust library `flq`, crates.io package `flq-audio` —
+the name `flq` is taken there; CLI `flq`). One format: **`flq encode`**
+writes framed `.flq` files (`src/v1/`) — decoded samples in independent
+CRC'd frames with index/seek/`--range`/`--only` and streaming decode.
+Inputs: WAV, AIFF/AIFF-C, FLAC, ALAC (`.m4a`) only — lossy input
+(MP3/AAC/Ogg) is rejected (`flq is lossless only`). `flq decode` reads
+them back; `flq bench` round-trips in memory. Normative bitstream:
+[`docs/SPEC-v1.md`](docs/SPEC-v1.md).
 
-## Invariants (do not break)
+## Format (do not break)
 
-- Exactness contract: WAV/AIFF/MP3/raw tracks decode **byte-exact** (whole file incl. metadata, CRC32-verified); FLAC/ALAC tracks decode **audio-exact** (identical samples + preserved tag blob, file re-encoded — original bytes are NOT recoverable).
-- Never worse than storing the file: every adaptive path has a byte-size check and falls back to a stored/raw variant — MP3 modeled→mode 0, FLAC/ALAC PCM→kind 4, any decode failure→raw.
-- Self-verification: MP3 mode 1 is decoded+rebuilt during encode; FLAC output is re-decoded and sample-compared during decode; every track passes CRC before being written out.
-- v1 `.flq` files must stay decodable.
-- Joint coding is additive only: per-block byte accounting decides; a block is stored by reference only when smaller. References are PCM-coded tracks only, same sample rate; each track's pool = optional self (earlier material, lag <= -block) + screened earlier tracks (top 4 by coarse NCC). A source is written to the file only when used, and only when the whole track is strictly cheaper with it.
-- Decode dependencies: self-refs stay inside their track; cross refs need the referenced track decoded first; an MP3 mode-2 payload needs every earlier modeled (mode 1|2) MP3 track decoded to advance the shared model. `--only` resolves the transitive closure of these; mode-0/raw and non-MP3 tracks break nothing — the chain spans them transparently.
+- Frame = shared codec (`codec::plan_track_with` + `write_track`) on a
+  slice of `frame_len` samples (default 16384, multiple of 4096,
+  `4096..=262144`): zero history at frame start, first `order` samples of
+  block 0 stored verbatim (`wbits` u6 + values, zero residual
+  placeholders). Float split per frame (`e` and fmode 1/2/3 per frame).
+- v1.0 bitstream is frozen: `testdata/v1/` vectors +
+  `v1_vectors_conform` check decode AND byte-identical re-encode. Any
+  change to encoder output (codec decisions included, e.g. preset
+  heuristics) breaks that test — it needs a spec/version decision, not a
+  vector regen.
+- Header version byte is `1`; readers reject anything else
+  (`unsupported flq version N (expected 1)`). There is no older-format
+  compatibility to preserve.
+- Reader: every allocation sized by file values is bounded by file
+  length or a constant cap; flags != 0 rejected (bit 0 reserved for
+  lossy). Decode is O(frame) (`decode_range_with`); CLI writes
+  `<name>.part` then renames.
+- Encoder output is identical for any `-j` (parallelism over frames).
+- Warm-up is always on — it is part of the block-0 wire format, not an
+  option.
+- No cross-track references anywhere: not in the codec, not on the wire.
+  Don't reintroduce a reference/pool path; the format has none.
 
-## Wire format (v3)
+## Invariants
 
-`FLQ1` + version 3 + track count + block size, then `meta_mode u8 | meta_raw_len u32 | meta_len u32 | meta` (deflate when smaller), then per-track payloads concatenated in track order (payload_len lives in each meta). Kinds: 0 WAV, 1 MP3 (mode 0 raw / 1 modeled / 2 modeled chained into the shared model carry — v3 metas only), 2 AIFF, 3 PCM from FLAC/ALAC, 4 raw stored. Each PCM-coded track has its own byte-aligned bitstream. The v2 joint flag becomes `self_ref u8 | nref u8 | refs[nref]` (earlier PCM tracks, strictly increasing). v1/v2 files still decode: v2 = inline metas + one shared PCM bitstream + u64-prefixed MP3/raw payloads; v1 = kindless WAV metas. Details live in the `container.rs` doc comment + code.
+- Exactness contract: decoded samples are identical to the source's
+  (WAV/AIFF verified against canonical PCM, `pcm_crc` on whole files);
+  FLAC/ALAC tag blocks are preserved and re-attached on FLAC output.
+- FLAC output is re-decoded and sample-compared during encode
+  (`formats::encode_flac` self-verifies); every track passes `pcm_crc`
+  before decode reports success.
+- Reject anything that isn't smaller/well-formed: crafted-input guards on
+  read (allocation caps, unary-run cap, escape-width cap, range checks).
+- `enc.rs` streams WAV/AIFF input (header scan then per-frame reads);
+  FLAC/ALAC inputs are decoded whole via symphonia first
+  (`shortcut:` in `v1/enc.rs`).
 
 ## Build / test
 
@@ -21,63 +54,115 @@ FLQ lossless audio codec (Rust library + CLI). Container v2 holds WAV, AIFF and 
 cargo build --release
 cargo test --release
 cargo clippy --release --all-targets
-cargo test --release -- --ignored --nocapture   # real WAV + MP3 fixtures (testdata/)
+cargo test --release -- --ignored --nocapture   # vector/demo generators only
+.\wasm\build.ps1                                 # WASM decoder -> web\flq_wasm.wasm (needs wasm32-unknown-unknown)
 ```
 
-Fixture tests resolve files via `env!("CARGO_MANIFEST_DIR")/testdata` — after renaming/moving the project dir they fail on stale paths until `cargo clean`. `cargo test` does not refresh `target\release\flq.exe` — run `cargo build --release` before CLI runs or sweeps.
+Generators (`gen_v1_vectors`, `gen_web_demo`) are `#[ignore]` tests that
+write committed files (`testdata/v1/`, `web/samples/demo.flq`); only
+rerun them when a format change was deliberately decided. Fuzz target
+lives in `fuzz/` (nightly + cargo-fuzz; CI runs it on Linux).
+
+Fixture tests resolve files via `env!("CARGO_MANIFEST_DIR")/testdata` —
+after renaming/moving the project dir they fail on stale paths until
+`cargo clean`. `cargo test` does not refresh `target\release\flq.exe` —
+run `cargo build --release` before CLI runs or sweeps. Shell is
+PowerShell; cargo's stderr shows up as a harmless `NativeCommandError`.
 
 ## Commits
 
-Agents NEVER run `git commit` — the user commits manually. Prepare changes, report, stop. Message style (for reference / when asked to draft one): short lowercase-ish subject, optional body; no "Generated with Devin", no Co-Authored-By trailers, no AI/tool mentions.
+Agents NEVER run `git commit` — the user commits manually. Prepare
+changes, report, stop. Message style (for reference / when asked to
+draft one): short lowercase-ish subject, optional body; no "Generated
+with Devin", no Co-Authored-By trailers, no AI/tool mentions.
 
 ## Corpus
 
-`sample_pack/` (gitignored) is a ~258-file audio corpus (wav/mp3/flac/aiff/ogg/m4a, incl. corrupted FLACs and MPEG-2.5 radio captures) used for format sweeps. Sweep scripts/logs live outside the repo; keep it that way — don't commit sweep tooling or raw logs.
+`sample_pack/` (gitignored) is a ~258-file audio corpus
+(wav/mp3/flac/aiff/ogg/m4a, incl. corrupted FLACs and MPEG-2.5 radio
+captures) used for format sweeps. Sweep scripts/logs live outside the
+repo; keep it that way — don't commit sweep tooling or raw logs.
 
-Codec A/B bench: `D:\TEMP\flq_ab\bench.py` compares FLQ vs FLAC/WavPack/OFR/TAK/APE/7z/zstd/paq8px single-file on the wav/aiff subset; results in `testdata/results/2026-10-22_e254a5b.md`. Reference binaries live under `D:\TEMP\flq_ab\` too (nothing external is committed).
+Codec A/B bench: `D:\TEMP\flq_ab\bench.py` compares FLQ vs
+FLAC/WavPack/OFR/TAK/APE/7z/zstd/paq8px single-file on the wav/aiff
+subset; results in `testdata/results/2026-10-22_e254a5b.md`. Reference
+binaries live under `D:\TEMP\flq_ab\` too (nothing external is
+committed).
 
 ## Test data & results
 
-`testdata/` holds ALL tracked test/bench inputs — tests must not read files elsewhere in the repo:
+`testdata/` holds ALL tracked test/bench inputs — tests must not read
+files elsewhere in the repo:
 
-- WAV originals: `birds_singing` (f64→f32 44.1k), `frogs_croaking` (i16 48k)
-- MP3 fixtures are NOT shipped (copyright): ignored MP3 tests glob `testdata/*.mp3` and skip when absent — drop any MPEG-1 L3 file in to enable
-- `birds_frogs.flq` — **v1 container**; cannot be regenerated by current code, never delete
-- `v2_a.wav`, `v2_b.wav`, `v2_joint.flq` — v2 joint fixture (decode must stay byte-exact)
+- WAV originals: `birds_singing` (f64→f32 44.1k), `frogs_croaking`
+  (i16 48k) — usable by CLI sweeps
+- `v1/` — conformance vectors + `MANIFEST.txt` (regenerated by
+  `gen_v1_vectors` after a deliberate format decision)
 
-Measurement runs write `testdata/results/YYYY-MM-DD[_tag].md` — ONE file per run, tag = commit sha or short label. Required content: per-file/per-pair table (in → out bytes, %, exactness), build/commit it ran on. These dated docs ARE committed (they replace the old `PAIR_RESULTS.md`); the sweep scripts that produce them stay outside the repo.
+Measurement runs write `testdata/results/YYYY-MM-DD[_tag].md` — ONE file
+per run, tag = commit sha or short label. Required content:
+per-file/per-pair table (in → out bytes, %, exactness), build/commit it
+ran on. Dated docs ARE committed.
 
 ## CLI
 
 ```powershell
-.\target\release\flq.exe encode [--no-joint] a.wav b.flac out.flq  # .wav .aiff/.aif/.aifc .flac .mp3 .m4a/.mp4 .aac .ogg, refuses to overwrite; --no-joint skips all reference analysis (ablation)
-.\target\release\flq.exe decode out.flq [-o dir] [--format flac|wav] [--only name ...]   # default dir: out_decoded, refuses to overwrite; --only decodes just the named tracks (refs/mode-2 chain deps are decoded internally, never written)
-.\target\release\flq.exe bench a.wav b.mp3            # in-memory encode+decode, sizes/gains/MP3 structure/time/cpu/heap/accuracy
+.\target\release\flq.exe encode [-0|-5|-8] [-j N] [--frame N] [--no-index] a.wav b.flac out.flq
+   # inputs: .wav .aiff/.aif/.aifc .flac .m4a(ALAC); lossy -> "lossy input ... not supported — flq is lossless only"; refuses to overwrite
+.\target\release\flq.exe decode out.flq [-o dir] [--format flac|wav] [--only name ...] [--range a:b]
+   # --range in seconds; default format = source family
+.\target\release\flq.exe info out.flq
+.\target\release\flq.exe bench [-0|-5|-8] [-j N] [--frame N] a.wav b.flac   # in-memory encode+decode+verify
 ```
 
-Reference results: birds_singing.wav + frogs_croaking.wav: 20,900,976 B -> 8,055,0xx B, bit-exact, encode ~2 s, decode ~0.2 s. Two 320k MPEG-1 songs: mode 1 saves ~12–17% vs raw. sample_pack sweep (256 files, 2.24 GiB): ~1.47 GiB (67.3%), everything recovered exact — WAV int ~55%, WAV float ~53%, AIFF f32 ~78%, MP3 modeled ~84% median (best ~76%), FLAC->PCM ~98% (near parity with source FLAC), Ogg/M4A/raw 100%.
+Reference results (47-file common set,
+`testdata/results/2026-10-22_9f25157.md`): 50.87% at frame_len 16384
+(+0.10 pp vs continuous coding), smaller than FLAC -8 on 43/47;
+148 WAV/AIFF: 55.75%, encode ≤ 53 MiB heap, decode ≤ 0.8 MiB.
 
 ## Known limits
 
-- Whole-file-in-memory codec; peak heap ~20x WAV input (~1.6 GiB on a 77 MB WAV). No streaming. Encode/bench print a rough peak-heap estimate and warn past ~50% of physical RAM.
-- Crafted-input guards on decode: a PCM track's declared stream is capped at ~2^30 channel-samples and must be feasible against the remaining payload bits; modeled-MP3 payloads bound item counts and raw-item lengths by their actual coded size (overrun checked per frame/item).
-- Joint references come only from earlier PCM-coded tracks (self + up to 4 screened candidates); lossy-track kinds never join. Self+cross analysis roughly doubles PCM encode time; decode frees a referenced track's streams after its last consumer.
-- Modeled MP3 targets MPEG-1 Layer III only — MPEG-2/2.5, Layer I/II, free-format -> raw. Encode tries both fresh (mode 1) and chained (mode 2) models per track, so modeled MP3 encoding ~doubles; mode-2 chains are sequential decode dependencies (no random access mid-chain).
-- PCM kind: bits 8/16/24 only (deeper FLACs -> raw). ALAC outputs FLAC (no ALAC encoder exists in Rust); PADDING/SEEKTABLE not preserved; tags are dropped on WAV output.
-- Sniff order matters in `formats::sniff`: ADTS is checked before generic MPEG audio (both start 0xFF); non-MPEG-1 MPEG audio -> MP3 kind -> raw payload; unknown input -> hard error.
+- Encode streams WAV/AIFF but FLAC/ALAC inputs are decoded whole first
+  (`shortcut:` in `v1/enc.rs`); decode is O(frame).
+- Sniff order matters in `formats::sniff`: ADTS is checked before
+  generic MPEG audio (both start 0xFF); MP4 family keeps the first
+  audio sample-entry fourcc (`alac` -> PCM path, anything else ->
+  lossy); everything lossy is a single generic `Sniff::Lossy` class —
+  payloads are never parsed.
+- PCM kind: bits 8/16/24/32 int + 32/64 float (deeper FLACs rejected by
+  the encoder). ALAC outputs FLAC (no ALAC encoder exists in Rust);
+  PADDING/SEEKTABLE not preserved; tags are dropped on WAV output.
+- 255 tracks max; `name_len ≤ 4096`, `tags_len ≤ 2^24`,
+  `meta_len ≤ 2^26`.
+- Crafted-input guards on decode: a track's declared stream is capped at
+  ~2^30 channel-samples and must be feasible against the remaining
+  payload bits; per-block Rice/unary reads are bounded by the payload.
 
 ## Layout
 
 - `src/bits.rs` — MSB-first bit IO, partitioned Rice + escape, CRC32
 - `src/wav.rs` — RIFF/WAVE parsing, prefix/PCM/suffix split
-- `src/aiff.rs` — AIFF/AIFF-C parsing to `wav::Wav` conventions, native PCM write-back
-- `src/formats.rs` — format sniffing, Symphonia FLAC/ALAC decode, tag blobs, flacenc encode + splice + re-decode verify, `decode_pcm`
+- `src/aiff.rs` — AIFF/AIFF-C parsing to `wav::Wav` conventions, native
+  PCM write-back
+- `src/formats.rs` — format sniffing, Symphonia FLAC/ALAC decode, tag
+  blobs, flacenc encode + splice + re-decode verify, `decode_pcm`
 - `src/codec.rs` — float split, stereo modes, LPC, block plan/write/read
-- `src/joint.rs` — FFT NCC analysis, per-block reference choice
-- `src/container.rs` — public API: `encode`, `encode_opts` (`joint=false` = `--no-joint` ablation), `decode`, `decode_subset`, `decode_pcm`, `Stats`; container v3 (kinds 0 WAV, 1 MP3, 2 AIFF, 3 PCM, 4 raw; v1/v2 files still decode)
-- `src/mp3/` — MPEG-1 L3 parser: `mod.rs` item scan/rebuild/stats, `frame.rs` header/side-info/granule decode+encode, `huffman.rs` tree decode + derived encode tables, `tables.rs` vendored Annex-B tables (credit: puremp3, MIT/CC0), `rc.rs` LZMA-style adaptive range coder, `model.rs` context-modeled serializer (container MP3 mode 1)
-- `src/main.rs` — CLI + metrics (counting allocator for peak heap, `GetProcessTimes` for CPU)
+- `src/v1/` — the format: `mod.rs` header/meta/frame/index layouts +
+  validation + `valid_name`, `enc.rs` streaming encoder (parallel
+  frames), `dec.rs` `Reader` (index/seek, `decode_range_with`,
+  sequential scan + resync), `tests.rs`
+- `src/main.rs` — CLI + metrics (counting allocator for peak heap,
+  `GetProcessTimes` for CPU)
+- `wasm/` — `flq-wasm` cdylib, raw `extern "C"` decoder exports (no
+  deps); `web/` — vanilla JS player (Pages); `fuzz/` — cargo-fuzz
+  target `v1_reader`
+- `docs/SPEC-v1.md` — normative bitstream; `testdata/v1/` — conformance
+  vectors + MANIFEST
 
-`bench` accuracy labels: `bit-exact` = byte-identical file; `audio-exact` = identical samples + tags (file re-encoded). Adding a format: byte-exact container (like WAV) -> own kind + prefix/PCM/suffix; lossless codec -> decode via symphonia into kind 3 (decide tags); lossy -> sniff into kind 4 raw. Keep the "not smaller/decode fails -> raw" fallback and add tests: synthetic builder round-trip, corrupted input -> raw.
+`bench` accuracy labels: `audio-exact` = identical samples (file
+re-encoded). Adding an input format: byte-exact container (like WAV) ->
+extend `formats::sniff` + a `v1` origin; lossless codec -> decode via
+symphonia like FLAC/ALAC; lossy -> `Sniff::Lossy`.
 
-Dependencies: `rustfft = "=6.4.1"`, `symphonia = "=0.6.1"` (features flac/isomp4/alac), `flacenc = "=0.5.1"`, `miniz_oxide = "=0.9.1"` (v3 meta deflate). All tests must run in release mode (< 60 s total).
+Dependencies: `symphonia = "=0.6.1"` (features flac/isomp4/alac),
+`flacenc = "=0.5.1"`. All tests must run in release mode (< 60 s total).

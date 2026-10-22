@@ -1,0 +1,17 @@
+[package]
+name = "flq-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+flq = { package = "flq-audio", path = ".." }
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true

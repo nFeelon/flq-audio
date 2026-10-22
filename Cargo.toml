@@ -1,7 +1,28 @@
 [package]
-name = "flq"
+name = "flq-audio"
 version = "0.1.0"
 edition = "2024"
+description = "FLQ: lossless audio format (framed, seekable, multi-track)"
+license = "MIT"
+repository = "https://github.com/nFeelon/flq-audio"
+readme = "README.md"
+rust-version = "1.85"
+keywords = ["audio", "lossless", "codec", "flac", "compression"]
+categories = [
+    "multimedia::audio",
+    "compression",
+    "command-line-utilities",
+    "encoding",
+]
+exclude = [
+    "sample_pack/",
+    "fuzz/",
+    "wasm/",
+    "web/",
+    "testdata/",
+    "state/",
+    "docs/assets/",
+]
 
 [lib]
 name = "flq"
@@ -13,6 +34,4 @@ path = "src/main.rs"
 
 [dependencies]
 flacenc = { version = "=0.5.1", default-features = false }
-miniz_oxide = "=0.9.1"
-rustfft = "=6.4.1"
 symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "isomp4", "alac"] }

@@ -27,7 +27,7 @@ pub fn unzigzag(u: u64) -> i64 {
 #[derive(Default)]
 pub struct BitWriter {
     buf: Vec<u8>,
-    acc: u64,   // bits are staged MSB-first in the low `nb` bits of acc
+    acc: u64, // bits are staged MSB-first in the low `nb` bits of acc
     nb: u32,
     pub bits: u64,
 }
@@ -90,7 +90,11 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0, overrun: false }
+        Self {
+            buf,
+            pos: 0,
+            overrun: false,
+        }
     }
 
     /// Read `n` bits MSB-first. Bits past the end read as 0 and set `overrun`.
@@ -186,7 +190,11 @@ fn escape_cost(n_p: u64, width: u64) -> u64 {
 pub fn plan_residual(e: &[i64]) -> ResidualPlan {
     let n = e.len();
     if n == 0 {
-        return ResidualPlan { p: 0, params: Vec::new(), cost: 0 };
+        return ResidualPlan {
+            p: 0,
+            params: Vec::new(),
+            cost: 0,
+        };
     }
     let u: Vec<u64> = e.iter().map(|&v| zigzag(v)).collect();
     let mean = u.iter().fold(0u128, |a, &v| a + v as u128) / n as u128;
@@ -196,17 +204,15 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
     let k_hi = (center + 4).min(30);
     let ks: Vec<u64> = (u64::from(k_lo)..=u64::from(k_hi)).collect();
 
-    // prefix sums of u>>k for every k in the window
-    let ps: Vec<Vec<u64>> = ks
-        .iter()
-        .map(|&k| {
-            let mut acc = vec![0u64; n + 1];
-            for i in 0..n {
-                acc[i + 1] = acc[i].saturating_add(u[i] >> k);
-            }
-            acc
-        })
-        .collect();
+    // prefix sums of u>>k for every k in the window, one flat allocation
+    let mut ps = vec![0u64; ks.len() * (n + 1)];
+    for (ki, &k) in ks.iter().enumerate() {
+        let acc = &mut ps[ki * (n + 1)..(ki + 1) * (n + 1)];
+        for i in 0..n {
+            acc[i + 1] = acc[i].saturating_add(u[i] >> k);
+        }
+    }
+    let ps_row = |ki: usize| &ps[ki * (n + 1)..(ki + 1) * (n + 1)];
 
     // valid partition orders need n % 2^p == 0; finest = min(8, v2(n))
     let pf = (n.trailing_zeros() as u8).min(MAX_PART_ORDER);
@@ -215,10 +221,16 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
     let fp_len = n >> pf;
     let mut fine_max = vec![0u64; nf];
     for (j, m) in fine_max.iter_mut().enumerate() {
-        *m = u[j * fp_len..(j + 1) * fp_len].iter().fold(0, |a, &v| a.max(v));
+        *m = u[j * fp_len..(j + 1) * fp_len]
+            .iter()
+            .fold(0, |a, &v| a.max(v));
     }
 
-    let mut best = ResidualPlan { p: 0, params: Vec::new(), cost: u64::MAX };
+    let mut best = ResidualPlan {
+        p: 0,
+        params: Vec::new(),
+        cost: u64::MAX,
+    };
     for p in 0..=pf {
         let parts = 1usize << p;
         let n_p = (n >> p) as u64;
@@ -233,7 +245,8 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
             let width = u64::from(bit_len(max_u));
             let mut part = (escape_cost(n_p, width), PartParam::Escape(width as u8));
             for (ki, &k) in ks.iter().enumerate() {
-                let sum_q = ps[ki][t].saturating_sub(ps[ki][s]);
+                let row = ps_row(ki);
+                let sum_q = row[t].saturating_sub(row[s]);
                 let c = rice_cost(sum_q, n_p, k);
                 if c < part.0 {
                     part = (c, PartParam::Rice(k as u8));
@@ -243,7 +256,11 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
             params.push(part.1);
         }
         if total < best.cost {
-            best = ResidualPlan { p, params, cost: total };
+            best = ResidualPlan {
+                p,
+                params,
+                cost: total,
+            };
         }
     }
     best
@@ -289,7 +306,7 @@ pub fn read_residual(r: &mut BitReader<'_>, n: usize) -> Result<Vec<i64>, String
         return Err("partition order out of range".into());
     }
     let parts = 1usize << p;
-    if !n.is_multiple_of(parts) {
+    if n % parts != 0 {
         return Err("partition order does not divide residual length".into());
     }
     let n_p = n >> p;
@@ -329,7 +346,11 @@ const fn crc_table() -> [u32; 256] {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         t[i] = c;
@@ -341,11 +362,32 @@ const fn crc_table() -> [u32; 256] {
 static CRC_TABLE: [u32; 256] = crc_table();
 
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = CRC_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
+    let mut c = Crc32::new();
+    c.update(data);
+    c.finish()
+}
+
+/// Streaming CRC32 — `finish` equals `crc32` over the concatenated updates.
+pub struct Crc32(u32);
+
+impl Crc32 {
+    pub fn new() -> Self {
+        Self(0xFFFF_FFFF)
     }
-    crc ^ 0xFFFF_FFFF
+    pub fn update(&mut self, data: &[u8]) {
+        for &b in data {
+            self.0 = CRC_TABLE[((self.0 ^ u32::from(b)) & 0xFF) as usize] ^ (self.0 >> 8);
+        }
+    }
+    pub fn finish(self) -> u32 {
+        self.0 ^ 0xFFFF_FFFF
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -355,7 +397,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0 >> 33
         }
     }
@@ -407,7 +452,10 @@ mod tests {
         let e = vec![0i64; 4096];
         let (back, cost) = roundtrip(&e);
         assert_eq!(back, e);
-        assert!(cost <= 64, "all-zero residual cost {cost} must be <= 64 bits");
+        assert!(
+            cost <= 64,
+            "all-zero residual cost {cost} must be <= 64 bits"
+        );
     }
 
     #[test]
@@ -418,7 +466,7 @@ mod tests {
             .map(|_| {
                 let v = rng.next();
                 let mag = (v % 50) as i64 - 25;
-                if v.is_multiple_of(97) { mag * 4000 } else { mag }
+                if v % 97 == 0 { mag * 4000 } else { mag }
             })
             .collect();
         let (back, _) = roundtrip(&e);

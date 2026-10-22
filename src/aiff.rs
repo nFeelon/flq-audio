@@ -79,10 +79,38 @@ fn read_comm(payload: &[u8], is_aifc: bool) -> Result<Comm, String> {
             return Err("malformed AIFC COMM chunk".into());
         }
         match &payload[18..22] {
-            b"NONE" | b"twos" => (1u16, cb, Conv { be: true, int: true }),
-            b"sowt" => (1, cb, Conv { be: false, int: true }),
-            b"fl32" | b"FL32" => (3, 4, Conv { be: true, int: false }),
-            b"fl64" | b"FL64" => (3, 8, Conv { be: true, int: false }),
+            b"NONE" | b"twos" => (
+                1u16,
+                cb,
+                Conv {
+                    be: true,
+                    int: true,
+                },
+            ),
+            b"sowt" => (
+                1,
+                cb,
+                Conv {
+                    be: false,
+                    int: true,
+                },
+            ),
+            b"fl32" | b"FL32" => (
+                3,
+                4,
+                Conv {
+                    be: true,
+                    int: false,
+                },
+            ),
+            b"fl64" | b"FL64" => (
+                3,
+                8,
+                Conv {
+                    be: true,
+                    int: false,
+                },
+            ),
             c => {
                 return Err(format!(
                     "unsupported AIFC compression {:?}",
@@ -91,7 +119,14 @@ fn read_comm(payload: &[u8], is_aifc: bool) -> Result<Comm, String> {
             }
         }
     } else {
-        (1, cb, Conv { be: true, int: true })
+        (
+            1,
+            cb,
+            Conv {
+                be: true,
+                int: true,
+            },
+        )
     };
     if conv.int {
         // AIFF stores samples left-justified; keep the raw container value.
@@ -103,15 +138,23 @@ fn read_comm(payload: &[u8], is_aifc: bool) -> Result<Comm, String> {
     }
     let bits = 8 * cb;
     Ok(Comm {
-        fmt: Fmt { tag, channels, rate, bits, block_align: channels * cb },
+        fmt: Fmt {
+            tag,
+            channels,
+            rate,
+            bits,
+            block_align: channels * cb,
+            channel_mask: 0,
+        },
         conv,
         frames,
     })
 }
 
-/// Walk FORM chunks to COMM and SSND. Returns the COMM, the offset of the first
-/// sound byte (after SSND's offset+blockSize fields and `offset` skip bytes),
-/// and the number of sound bytes declared/available after it.
+/// Walk FORM chunks to COMM and SSND. Returns the COMM, the offset of the
+/// first sound byte (after SSND's offset+blockSize fields and `offset` skip
+/// bytes), and the SSND-declared sound byte count after it (NOT capped by
+/// the buffer length — callers clamp to what the file actually holds).
 fn scan(bytes: &[u8]) -> Result<(Comm, usize, usize), String> {
     if bytes.len() < 12 || &bytes[0..4] != b"FORM" {
         return Err("not a FORM file".into());
@@ -144,16 +187,11 @@ fn scan(bytes: &[u8]) -> Result<(Comm, usize, usize), String> {
             if snd > bytes.len() {
                 return Err("SSND offset beyond end of file".into());
             }
-            let avail = size
-                .saturating_sub(8)
-                .saturating_sub(offset)
-                .min(bytes.len() - snd);
-            return Ok((c, snd, avail));
+            let declared = size.saturating_sub(8).saturating_sub(offset);
+            return Ok((c, snd, declared));
         }
         // chunks are padded to even sizes
-        let next = dstart
-            .saturating_add(size)
-            .saturating_add(size & 1);
+        let next = dstart.saturating_add(size).saturating_add(size & 1);
         if next <= pos {
             break;
         }
@@ -223,7 +261,8 @@ fn conv_pcm(b: &[u8], conv: Conv, cb: usize) -> Vec<u8> {
 
 /// Parse an AIFF/AIFC file into a `Wav` in WAV convention (LE, 8-bit unsigned).
 pub fn parse(bytes: &[u8]) -> Result<Wav, String> {
-    let (c, snd, avail) = scan(bytes)?;
+    let (c, snd, declared) = scan(bytes)?;
+    let avail = declared.min(bytes.len() - snd);
     let align = c.fmt.block_align as usize;
     let frames = c.frames.min((avail / align) as u64) as usize;
     let pcm_len = frames * align;
@@ -238,6 +277,36 @@ pub fn parse(bytes: &[u8]) -> Result<Wav, String> {
         prefix: bytes[..snd].to_vec(),
         pcm,
         suffix: bytes[snd + pcm_len..].to_vec(),
+    })
+}
+
+/// Header result for streaming encoders: COMM fields + sound position.
+/// `bytes` only has to reach the first sound byte; the payload need not be
+/// in the buffer.
+pub struct AiffHead {
+    pub fmt: Fmt,
+    pub frames: u64,      // COMM numSampleFrames
+    pub pcm_start: usize, // file offset of the first sound byte
+    pub avail: usize,     // SSND-declared sound bytes after pcm_start
+    conv: Conv,
+}
+
+impl AiffHead {
+    /// Native sound bytes -> WAV-convention bytes (per frame-aligned chunk).
+    pub fn to_wav_conv(&self, b: &[u8]) -> Vec<u8> {
+        conv_pcm(b, self.conv, (self.fmt.bits / 8) as usize)
+    }
+}
+
+/// Header-only scan for streaming encoders.
+pub fn scan_prefix(bytes: &[u8]) -> Result<AiffHead, String> {
+    let (c, snd, declared) = scan(bytes)?;
+    Ok(AiffHead {
+        fmt: c.fmt,
+        frames: c.frames,
+        pcm_start: snd,
+        avail: declared,
+        conv: c.conv,
     })
 }
 
@@ -258,19 +327,19 @@ pub(crate) mod tests {
     use super::*;
     use crate::wav;
 
-    /// AIFF/AIFC synthetic builder used by tests here and in container.rs.
+    /// AIFF/AIFC synthetic builder used by tests here and in formats.rs.
     pub struct AiffBuilder {
         pub aifc: bool,
         pub compression: [u8; 4],
         pub channels: u16,
         pub rate: u32,
-        pub bits: u16,       // COMM sampleSize
-        pub frames: u32,     // COMM numSampleFrames
-        pub pre_chunks: Vec<Vec<u8>>,   // extra chunks before COMM
-        pub mid_chunks: Vec<Vec<u8>>,   // chunks between COMM and SSND
-        pub post_chunks: Vec<Vec<u8>>,  // chunks after SSND
+        pub bits: u16,                 // COMM sampleSize
+        pub frames: u32,               // COMM numSampleFrames
+        pub pre_chunks: Vec<Vec<u8>>,  // extra chunks before COMM
+        pub mid_chunks: Vec<Vec<u8>>,  // chunks between COMM and SSND
+        pub post_chunks: Vec<Vec<u8>>, // chunks after SSND
         pub ssnd_offset: u32,
-        pub sound: Vec<u8>,  // native sound bytes
+        pub sound: Vec<u8>, // native sound bytes
     }
 
     impl AiffBuilder {
@@ -326,7 +395,11 @@ pub(crate) mod tests {
             ssnd.extend(0u32.to_be_bytes()); // blockSize
             ssnd.extend(vec![0xEEu8; self.ssnd_offset as usize]);
             ssnd.extend(&self.sound);
-            let mut body = if self.aifc { b"AIFC".to_vec() } else { b"AIFF".to_vec() };
+            let mut body = if self.aifc {
+                b"AIFC".to_vec()
+            } else {
+                b"AIFF".to_vec()
+            };
             for (i, c) in self.pre_chunks.iter().enumerate() {
                 body.extend(chunk(b"JUNK", c));
                 let _ = i;
@@ -452,7 +525,13 @@ pub(crate) mod tests {
             .into_iter()
             .map(|c| {
                 c.iter()
-                    .map(|&w| if bits == 64 { ((w as u32 as i32) as f64).to_bits() } else { w })
+                    .map(|&w| {
+                        if bits == 64 {
+                            ((w as u32 as i32) as f64).to_bits()
+                        } else {
+                            w
+                        }
+                    })
                     .collect()
             })
             .collect();
@@ -478,7 +557,7 @@ pub(crate) mod tests {
         let sig = vec![vec![10i64, 20, 30, -40, 50]];
         let mut b = AiffBuilder::new(1, 44100, 16, 5);
         b.pre_chunks = vec![vec![1, 2, 3]]; // odd size -> pad byte
-        b.mid_chunks = vec![vec![9; 7]];    // odd size -> pad byte
+        b.mid_chunks = vec![vec![9; 7]]; // odd size -> pad byte
         b.post_chunks = vec![vec![8; 6]];
         b.ssnd_offset = 4;
         b.sound = be_int_pcm(&sig, 16);
@@ -519,7 +598,11 @@ pub(crate) mod tests {
         let file = b.build();
         let w = parse(&file).unwrap();
         assert_eq!(w.frames, 4);
-        assert_eq!(w.suffix.len(), 4, "2 extra frames go to suffix (even, no pad)");
+        assert_eq!(
+            w.suffix.len(),
+            4,
+            "2 extra frames go to suffix (even, no pad)"
+        );
         let ints = wav::channel_ints(&w);
         assert_eq!(ints, vec![vec![1i64, 2, 3, 4]]);
     }

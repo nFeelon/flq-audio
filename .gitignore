@@ -22,4 +22,15 @@ Desktop.ini
 *.flq
 *_decoded/
 !testdata/*.flq
+!testdata/v1/*.flq
+!fuzz/corpus/**/*.flq
+!web/samples/*.flq
 /sample_pack
+
+# cargo-fuzz
+fuzz/target/
+fuzz/artifacts/
+
+# wasm build output (CI builds it into Pages)
+web/flq_wasm.wasm
+wasm/target/

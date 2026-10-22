@@ -3,13 +3,11 @@
 use crate::bits::{
     BitReader, BitWriter, ResidualPlan, bit_len, plan_residual, read_residual, write_residual,
 };
-use crate::joint::{RefChoice, choose_ref, ref_pred, seg_index};
 
 pub const BLOCK: usize = 4096;
 pub const MAX_ORDER: usize = 32;
 pub const ORDERS: [usize; 9] = [0, 1, 2, 4, 8, 12, 16, 24, 32];
 pub const LPC_PREC: u32 = 15;
-pub const Y_LIMIT: i64 = 1 << 40;
 
 // ---------------------------------------------------------------- float
 
@@ -57,7 +55,11 @@ pub fn split_float(words: &[Vec<u64>], mw: u8) -> FloatData {
             if ef != 0 && ef != emask as i64 && s <= i64::from(mw) {
                 let m = (w & mmask) | (1u64 << mw);
                 let mag = (m >> s) as i64;
-                si.push(if (w >> (u32::from(mw) + expw)) & 1 == 1 { -mag } else { mag });
+                si.push(if (w >> (u32::from(mw) + expw)) & 1 == 1 {
+                    -mag
+                } else {
+                    mag
+                });
                 sd.push(DBit::Bits(m & ((1u64 << s) - 1), s as u32));
             } else {
                 si.push(0);
@@ -67,7 +69,11 @@ pub fn split_float(words: &[Vec<u64>], mw: u8) -> FloatData {
         streams.push(si);
         dd.push(sd);
     }
-    FloatData { e: e_max as i16, streams, d: dd }
+    FloatData {
+        e: e_max as i16,
+        streams,
+        d: dd,
+    }
 }
 
 /// Rebuild a float stream word from |I|, its sign, and the `s` low mantissa bits.
@@ -126,10 +132,12 @@ fn autocorr(sig: &[i64], win: &[f64]) -> [f64; MAX_ORDER + 1] {
     r
 }
 
-/// Levinson–Durbin; `sol[p]` = coefficients for order p (empty when unavailable).
+/// Levinson–Durbin; `sol[p]` = coefficients for order p (empty when
+/// unavailable).
 fn levinson(r: &[f64; MAX_ORDER + 1]) -> Vec<Vec<f64>> {
     let mut sol: Vec<Vec<f64>> = vec![Vec::new(); MAX_ORDER + 1];
     let mut a = vec![0f64; MAX_ORDER + 1];
+    let mut na = vec![0f64; MAX_ORDER + 1];
     let mut err = r[0];
     for p in 1..=MAX_ORDER {
         let mut acc = r[p];
@@ -140,12 +148,12 @@ fn levinson(r: &[f64; MAX_ORDER + 1]) -> Vec<Vec<f64>> {
         if !kp.is_finite() {
             break;
         }
-        let mut na = a.clone();
+        na.copy_from_slice(&a);
         na[p] = kp;
         for k in 1..p {
             na[k] = a[k] - kp * a[p - k];
         }
-        a = na;
+        std::mem::swap(&mut a, &mut na);
         err *= 1.0 - kp * kp;
         if err <= 0.0 || !err.is_finite() {
             break;
@@ -174,11 +182,18 @@ pub struct SignalPlan {
     pub order: u8,
     pub qshift: u8,
     pub q: Vec<i16>,
+    /// Warm-up field presence: Some(wbits) when the signal sits in a
+    /// stream's first block with order > 0 — Some(0) = field present but no
+    /// warm-up values (signed width > 63). None = ordinary block.
+    pub warm_wbits: Option<u8>,
+    /// Verbatim warm-up values (len = `warm_wbits` count, i.e. `order`).
+    pub warm: Vec<i64>,
     pub resid: Vec<i64>,
     pub rplan: ResidualPlan,
 }
 
 impl SignalPlan {
+    /// Exact bit count `write_track` emits for this signal.
     pub fn cost(&self) -> u64 {
         self.rplan.cost
             + 6
@@ -187,6 +202,9 @@ impl SignalPlan {
             } else {
                 0
             }
+            + self
+                .warm_wbits
+                .map_or(0, |w| 6 + u64::from(self.order) * u64::from(w))
     }
 }
 
@@ -198,33 +216,158 @@ fn predict_at(w: &[i64], i: usize, q: &[i16], qshift: u8) -> i64 {
     s >> qshift
 }
 
-/// Best LPC coding for one coded signal: `w` = window [s-32, e), last `n` are the block.
-fn plan_signal(w: &[i64], n: usize) -> SignalPlan {
+/// Minimal signed bit width holding every value (1 for empty/all-zero).
+fn signed_bits(vals: &[i64]) -> u8 {
+    vals.iter()
+        .map(|&v| {
+            if v >= 0 {
+                64 - v.leading_zeros() + 1
+            } else {
+                64 - (!v).leading_zeros() + 1
+            }
+        })
+        .max()
+        .unwrap_or(1) as u8
+}
+
+/// Fully evaluate one LPC order given its quantized coefficients:
+/// residual + residual plan. In a stream's first block (`warm` = the
+/// order), the first `warm` positions are carried as explicit verbatim
+/// warm-up fields (residual placeholder 0) rather than predictions —
+/// unless their signed width exceeds the 6-bit `wbits` field's 63-bit
+/// maximum, when `warm_wbits` = Some(0) marks "decode normally".
+fn eval_order(w: &[i64], n: usize, o: usize, qshift: u8, q: Vec<i16>, warm: usize) -> SignalPlan {
+    let warm = warm.min(n);
+    let warm_vals: Vec<i64> = (0..warm).map(|i| w[MAX_ORDER + i]).collect();
+    let wbits = signed_bits(&warm_vals);
+    let (warm_wbits, warm_vals, nw) = if warm > 0 && wbits <= 63 {
+        (Some(wbits), warm_vals.clone(), warm)
+    } else if warm > 0 {
+        (Some(0), Vec::new(), 0)
+    } else {
+        (None, Vec::new(), 0)
+    };
+    let resid: Vec<i64> = (0..n)
+        .map(|i| {
+            if i < nw {
+                0
+            } else {
+                w[MAX_ORDER + i].wrapping_sub(predict_at(w, MAX_ORDER + i, &q, qshift))
+            }
+        })
+        .collect();
+    let rp = plan_residual(&resid);
+    SignalPlan {
+        order: o as u8,
+        qshift,
+        q,
+        warm_wbits,
+        warm: warm_vals,
+        resid,
+        rplan: rp,
+    }
+}
+
+/// Best LPC coding for one coded signal: `w` = window [s-32, e), last `n` are
+/// the block. `preset`: 8 = evaluate every candidate order (exact); 5 =
+/// rank candidates by a quantized-residual proxy (stride 2) and fully
+/// evaluate only the top 2; 0 = same with stride 4 and only the top 1.
+/// Order 0 is always evaluated. `warm` marks a stream's first block: the
+/// first `order` positions of every evaluated order are coded verbatim
+/// (prediction 0) instead of against a zero history. `win` is the shared
+/// per-block Tukey window.
+fn plan_signal_win(w: &[i64], n: usize, preset: u8, win: &[f64], warm: bool) -> SignalPlan {
     let blk = &w[MAX_ORDER..];
     let mut best = {
         let r0: Vec<i64> = blk.to_vec();
         let rp = plan_residual(&r0);
-        SignalPlan { order: 0, qshift: 0, q: Vec::new(), resid: r0, rplan: rp }
+        SignalPlan {
+            order: 0,
+            qshift: 0,
+            q: Vec::new(),
+            warm_wbits: None,
+            warm: Vec::new(),
+            resid: r0,
+            rplan: rp,
+        }
     };
-    let win = tukey(n);
-    let r = autocorr(blk, &win);
+    let r = autocorr(blk, win);
     if r[0] == 0.0 {
         return best;
     }
     let sol = levinson(&r);
-    for &o in ORDERS.iter().skip(1) {
-        let a = &sol[o];
-        if a.is_empty() {
-            continue;
+    let cands: Vec<usize> = ORDERS
+        .iter()
+        .skip(1)
+        .copied()
+        .filter(|&o| !sol[o].is_empty())
+        .collect();
+    if preset >= 8 {
+        for &o in &cands {
+            let Some((qshift, q)) = quantize(&sol[o]) else {
+                continue;
+            };
+            let cand = eval_order(w, n, o, qshift, q, if warm { o } else { 0 });
+            if cand.cost() < best.cost() {
+                best = cand;
+            }
         }
-        let Some((qshift, q)) = quantize(a) else { continue };
-        let resid: Vec<i64> = (0..n)
-            .map(|i| w[MAX_ORDER + i].wrapping_sub(predict_at(w, MAX_ORDER + i, &q, qshift)))
+    } else {
+        // Rank candidates by a quantized-residual proxy: predict a strided
+        // subset of block positions with the real (15-bit) coefficients and
+        // estimate total residual energy from their mean |r|. This sees the
+        // actual quantization damage a Levinson-error estimate cannot.
+        let stride = if preset == 0 { 4 } else { 2 };
+        let keep = if preset == 0 { 1 } else { 2 };
+        let mut ranked: Vec<(f64, usize, u8, Vec<i16>)> = Vec::with_capacity(cands.len());
+        for &o in &cands {
+            let Some((qshift, q)) = quantize(&sol[o]) else {
+                continue;
+            };
+            // warm-up positions are carried verbatim, not as residuals: skip
+            // them in the mean-|r| estimate and charge `order * wbits` bits
+            let warm_n = (o.min(n)).min(if warm { o } else { 0 });
+            let wbits_est = u64::from(signed_bits(
+                &(0..warm_n).map(|i| w[MAX_ORDER + i]).collect::<Vec<_>>(),
+            ));
+            let warm_n = if wbits_est <= 63 { warm_n } else { 0 };
+            let (mut sum_abs, mut m) = (0u128, 0u64);
+            let mut i = 0;
+            while i < n {
+                if i >= warm_n {
+                    let r_i =
+                        w[MAX_ORDER + i].wrapping_sub(predict_at(w, MAX_ORDER + i, &q, qshift));
+                    sum_abs += u128::from(r_i.unsigned_abs());
+                    m += 1;
+                }
+                i += stride;
+            }
+            let mean = if m > 0 {
+                sum_abs as f64 / m as f64
+            } else {
+                0.0
+            };
+            let proxy = n as f64 * (mean + 1.0).log2()
+                + o as f64 * f64::from(LPC_PREC)
+                + o as f64 * wbits_est as f64;
+            ranked.push((proxy, o, qshift, q));
+        }
+        ranked.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1)) // ties prefer the lower order
+        });
+        let mut top: Vec<(usize, u8, Vec<i16>)> = ranked
+            .into_iter()
+            .take(keep)
+            .map(|(_, o, qshift, q)| (o, qshift, q))
             .collect();
-        let rp = plan_residual(&resid);
-        let cand = SignalPlan { order: o as u8, qshift, q, resid, rplan: rp };
-        if cand.cost() < best.cost() {
-            best = cand;
+        top.sort_unstable_by_key(|&(o, _, _)| o);
+        for (o, qshift, q) in top {
+            let cand = eval_order(w, n, o, qshift, q, if warm { o } else { 0 });
+            if cand.cost() < best.cost() {
+                best = cand;
+            }
         }
     }
     best
@@ -248,7 +391,10 @@ fn sub(a: &[i64], b: &[i64]) -> Vec<i64> {
 }
 
 fn mid(a: &[i64], b: &[i64]) -> Vec<i64> {
-    a.iter().zip(b).map(|(&x, &y)| x.wrapping_add(y) >> 1).collect()
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| x.wrapping_add(y) >> 1)
+        .collect()
 }
 
 /// Coded signal pair for a stereo mode over any window: 0 LR, 1 LS, 2 RS, 3 MS.
@@ -283,304 +429,141 @@ fn mode_of(mode: u8, l: usize, r: usize, m: usize, s: usize) -> (usize, usize) {
     }
 }
 
-fn d_cost(d: Option<&[Vec<DBit>]>, word_bits: u32, s: usize, e: usize) -> u64 {
-    d.map(|d| {
-        d.iter()
-            .flat_map(|ch| ch[s..e].iter())
-            .map(|b| match b {
-                DBit::Bits(_, n) => u64::from(*n),
-                DBit::Zero => 1,
-                DBit::Word(_) => 1 + u64::from(word_bits),
-            })
-            .sum()
-    })
-    .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------- planning
 
-/// A reference source in the bitstream pool: the track's own earlier
-/// material, or an earlier track (index into the meta refs list / the
-/// `cross` slice on decode).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Pool {
-    SelfRef,
-    Cross(u8),
-}
-
-/// One candidate reference source for planning (self or an earlier track).
-pub struct RefSource<'a> {
-    pub self_ref: bool,
-    /// Cross-track source index (meta order); ignored for self sources.
-    pub track: u8,
-    pub x: &'a [Vec<i64>],
-    pub peaks: &'a [Vec<i32>],
-    pub refine: i32,
-}
-
-/// Bits for the per-ref source index: ceil_log2(pool_len) (0 for pools of
-/// size 0 or 1).
-pub fn src_bits(pool_len: usize) -> u32 {
-    usize::BITS - pool_len.max(1).saturating_sub(1).leading_zeros()
-}
-
 pub struct TrackCtx<'a> {
-    pub x: &'a [Vec<i64>],            // code streams (int samples, or I for float)
-    pub d: Option<&'a [Vec<DBit>]>,   // float tail data
-    pub float_word_bits: u32,         // stream word width for escapes
-    pub sources: &'a [RefSource<'a>], // reference pool (empty = no ref bits)
-}
-
-pub struct AltBlock {
-    pub refs: Vec<Option<RefChoice>>,
-    pub mode: u8,
-    pub signals: Vec<SignalPlan>,
+    pub x: &'a [Vec<i64>],          // code streams (int samples, or I for float)
+    pub d: Option<&'a [Vec<DBit>]>, // float tail data
+    pub float_word_bits: u32,       // stream word width for escapes
 }
 
 pub struct BlockPlan {
     pub mode: u8,
-    pub signals: Vec<SignalPlan>, // variant A
-    pub alt: Option<AltBlock>,    // variant B, when strictly cheaper
+    pub signals: Vec<SignalPlan>,
 }
 
 pub struct TrackPlan {
     pub blocks: Vec<BlockPlan>,
-    pub independent: u64,
-    pub stereo: u64,
-    pub joint_bits: u64,
-    pub float_bits: u64,
-    pub joint_on: bool,
-    /// Blocks where each pool source supplied >= 1 channel reference.
-    pub source_blocks: Vec<u64>,
 }
 
+/// Result for one block: the plan pieces. The sample window is rebuilt in
+/// the sequential loop (cheap copy) rather than kept.
+struct VarA {
+    mode_a: u8,
+    sigs_a: Vec<SignalPlan>,
+}
+
+/// One block's plan; pure function of the input streams — safe to compute
+/// in parallel across blocks.
+fn variant_a(ctx: &TrackCtx<'_>, stereo: bool, s: usize, e: usize, preset: u8) -> VarA {
+    let n = e - s;
+    let w: Vec<Vec<i64>> = ctx.x.iter().map(|x| window(x, s, e)).collect();
+    let win = tukey(n);
+    let warm = s == 0;
+    let ps = |wc: &[i64]| plan_signal_win(wc, n, preset, &win, warm);
+    let raw: Vec<SignalPlan> = w.iter().map(|wc| ps(wc)).collect();
+    let (mode_a, sigs_a) = if stereo {
+        let sig_s = ps(&sub(&w[0], &w[1]));
+        let sig_m = ps(&mid(&w[0], &w[1]));
+        let (c0, c1, cs, cm) = (raw[0].cost(), raw[1].cost(), sig_s.cost(), sig_m.cost());
+        let modes = [c0 + c1, c0 + cs, c1 + cs, cm + cs];
+        let m = modes
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &c)| c)
+            .map(|(i, _)| i)
+            .unwrap();
+        let mut it = raw.into_iter();
+        let (l, r) = (it.next().unwrap(), it.next().unwrap());
+        let sigs = match mode_of(m as u8, 0, 1, 2, 3) {
+            (0, 1) => vec![l, r],
+            (0, 3) => vec![l, sig_s],
+            (1, 3) => vec![r, sig_s],
+            _ => vec![sig_m, sig_s],
+        };
+        (m as u8, sigs)
+    } else {
+        (0u8, raw)
+    };
+    VarA { mode_a, sigs_a }
+}
+
+// Kept as the exact preset-8/single-thread entry point (tests);
+// encode paths go through `plan_track_with`.
+#[allow(dead_code)]
 pub fn plan_track(ctx: &TrackCtx<'_>) -> TrackPlan {
+    plan_track_with(ctx, 8, 1)
+}
+
+/// Plan a track. `preset` selects the LPC order search depth (0/5/8; see
+/// `plan_signal`). `threads` splits the per-block variant-A work across
+/// `std::thread::scope` chunks; the output is identical for any thread count.
+pub fn plan_track_with(ctx: &TrackCtx<'_>, preset: u8, threads: usize) -> TrackPlan {
     let ch = ctx.x.len();
     let frames = ctx.x.first().map_or(0, |x| x.len());
     let stereo = ch == 2;
     let nb = frames.div_ceil(BLOCK);
-    let nsrc = ctx.sources.len();
-    let analysis = nsrc > 0;
-    let sbits = u64::from(src_bits(nsrc));
-    let mut prev_lag: Vec<Option<(usize, i32)>> = vec![None; ch];
     let mut plans = Vec::with_capacity(nb);
-    let (mut ind_t, mut st_t, mut jt_t, mut d_t) = (0u64, 0u64, 0u64, 0u64);
-    let mut source_blocks = vec![0u64; nsrc];
 
-    for b in 0..nb {
+    // variant A for all blocks — independent, parallelized over chunks
+    let va_at = |b: usize| {
         let s = b * BLOCK;
         let e = (s + BLOCK).min(frames);
-        let n = e - s;
-        let w: Vec<Vec<i64>> = ctx.x.iter().map(|x| window(x, s, e)).collect();
-        let d_b = d_cost(ctx.d, ctx.float_word_bits, s, e);
-        d_t += d_b;
-
-        // variant A ----------------------------------------------------
-        let raw: Vec<SignalPlan> = w.iter().map(|wc| plan_signal(wc, n)).collect();
-        let ind_b: u64 = raw.iter().map(|p| p.cost()).sum::<u64>() + d_b;
-        let (st_b, mode_a, sigs_a) = if stereo {
-            let sig_s = plan_signal(&sub(&w[0], &w[1]), n);
-            let sig_m = plan_signal(&mid(&w[0], &w[1]), n);
-            let (c0, c1, cs, cm) = (raw[0].cost(), raw[1].cost(), sig_s.cost(), sig_m.cost());
-            let modes = [c0 + c1, c0 + cs, c1 + cs, cm + cs];
-            let m = modes
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, &c)| c)
-                .map(|(i, _)| i)
-                .unwrap();
-            let mut it = raw.into_iter();
-            let (l, r) = (it.next().unwrap(), it.next().unwrap());
-            let sigs = match mode_of(m as u8, 0, 1, 2, 3) {
-                (0, 1) => vec![l, r],
-                (0, 3) => vec![l, sig_s],
-                (1, 3) => vec![r, sig_s],
-                _ => vec![sig_m, sig_s],
-            };
-            (2 + modes[m] + d_b, m as u8, sigs)
-        } else {
-            (ind_b, 0u8, raw)
-        };
-        ind_t += ind_b;
-        st_t += st_b;
-
-        // variant B ----------------------------------------------------
-        let mut alt: Option<AltBlock> = None;
-        let mut b_cost: Option<u64> = None;
-        if analysis {
-            let mut refs: Vec<Option<RefChoice>> = Vec::with_capacity(ch);
-            let mut lags: Vec<Option<(usize, i32)>> = vec![None; ch];
-            let mut any = false;
-            for c in 0..ch {
-                let mut best: Option<(RefChoice, f64)> = None;
-                for (si, src) in ctx.sources.iter().enumerate() {
-                    let mut cands: Vec<i32> = src
-                        .peaks
-                        .get(seg_index(s, src.peaks.len().max(1)))
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some((psi, l)) = prev_lag[c]
-                        && psi == si
-                    {
-                        cands.push(l);
+        variant_a(ctx, stereo, s, e, preset)
+    };
+    let vas: Vec<VarA> = if threads > 1 && nb > 1 {
+        let chunk = nb.div_ceil(threads.min(nb));
+        let mut slots: Vec<Option<VarA>> = (0..nb).map(|_| None).collect();
+        std::thread::scope(|sc| {
+            for (ci, slice) in slots.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                sc.spawn(move || {
+                    for (i, slot) in slice.iter_mut().enumerate() {
+                        *slot = Some(va_at(base + i));
                     }
-                    // self refs may only use already-decoded material: every
-                    // predicted position gp+lag, gp in [s-MAX_ORDER, e), must
-                    // be < s, i.e. lag <= -(e - s)
-                    let lag_ok =
-                        |lag: i32| !src.self_ref || i64::from(lag) <= s as i64 - e as i64;
-                    if let Some((mut g, score)) = choose_ref(
-                        &ctx.x[c][s..e],
-                        src.x,
-                        s,
-                        &cands,
-                        src.refine,
-                        lag_ok,
-                    ) {
-                        g.src = si as u8;
-                        if best.is_none_or(|(_, bs)| score > bs) {
-                            best = Some((g, score));
-                        }
-                    }
-                }
-                lags[c] = best.map(|(g, _)| (g.src as usize, g.lag));
-                if best.is_some() {
-                    any = true;
-                }
-                refs.push(best.map(|(g, _)| g));
+                });
             }
-            if any {
-                // y = x - P over the whole window
-                let mut y = w.clone();
-                let mut overflow = false;
-                for c in 0..ch {
-                    if let Some(g) = &refs[c] {
-                        let rc = &ctx.sources[g.src as usize].x[g.ref_ch as usize];
-                        for (i, yv) in y[c].iter_mut().enumerate() {
-                            let gp = s as i64 - MAX_ORDER as i64 + i as i64;
-                            *yv = yv.wrapping_sub(ref_pred(g, rc, gp + i64::from(g.lag)));
-                            if yv.saturating_abs() > Y_LIMIT {
-                                overflow = true;
-                            }
-                        }
-                    }
-                }
-                if !overflow {
-                    let nrefs = refs.iter().flatten().count() as u64;
-                    let raw_b: Vec<SignalPlan> = y.iter().map(|yc| plan_signal(yc, n)).collect();
-                    let (cost, mode_b, sigs_b) = if stereo {
-                        let ss = plan_signal(&sub(&y[0], &y[1]), n);
-                        let sm = plan_signal(&mid(&y[0], &y[1]), n);
-                        let (c0, c1, cs, cm) =
-                            (raw_b[0].cost(), raw_b[1].cost(), ss.cost(), sm.cost());
-                        let modes = [c0 + c1, c0 + cs, c1 + cs, cm + cs];
-                        let m = modes
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|&(_, &c)| c)
-                            .map(|(i, _)| i)
-                            .unwrap();
-                        let mut it = raw_b.into_iter();
-                        let (l, r) = (it.next().unwrap(), it.next().unwrap());
-                        let sigs = match mode_of(m as u8, 0, 1, 2, 3) {
-                            (0, 1) => vec![l, r],
-                            (0, 3) => vec![l, ss],
-                            (1, 3) => vec![r, ss],
-                            _ => vec![sm, ss],
-                        };
-                        (2 + modes[m] + (66 + sbits) * nrefs + d_b, m as u8, sigs)
-                    } else {
-                        (
-                            raw_b.iter().map(|p| p.cost()).sum::<u64>()
-                                + (66 + sbits) * nrefs
-                                + d_b,
-                            0,
-                            raw_b,
-                        )
-                    };
-                    b_cost = Some(cost);
-                    if cost < st_b {
-                        alt = Some(AltBlock { refs: refs.clone(), mode: mode_b, signals: sigs_b });
-                        // count the block once per source used (any channel)
-                        for (si, sb) in source_blocks.iter_mut().enumerate() {
-                            if refs.iter().flatten().any(|g| g.src as usize == si) {
-                                *sb += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            for c in 0..ch {
-                prev_lag[c] = if alt.is_some() { lags[c] } else { None };
-            }
-        }
+        });
+        slots.into_iter().map(|s| s.unwrap()).collect()
+    } else {
+        (0..nb).map(va_at).collect()
+    };
 
-        let jt_b = if analysis {
-            ch as u64 + b_cost.map_or(st_b, |c| c.min(st_b))
-        } else {
-            st_b
-        };
-        jt_t += jt_b;
-        plans.push(BlockPlan { mode: mode_a, signals: sigs_a, alt });
+    for va in vas {
+        plans.push(BlockPlan {
+            mode: va.mode_a,
+            signals: va.sigs_a,
+        });
     }
 
-    // joint coding adds (1 self_ref + 1 nref + nref) refspec bytes to the
-    // track meta — count them against the joint total (nref before pruning:
-    // a conservative superset of what will actually be written)
-    let nref = ctx.sources.iter().filter(|s| !s.self_ref).count() as u64;
-    let joint_on = analysis && jt_t + (2 + nref) * 8 < st_t;
-    if !joint_on {
-        source_blocks.iter_mut().for_each(|v| *v = 0);
-    }
-    TrackPlan {
-        blocks: plans,
-        independent: ind_t,
-        stereo: st_t,
-        joint_bits: jt_t,
-        float_bits: d_t,
-        joint_on,
-        source_blocks,
-    }
+    TrackPlan { blocks: plans }
 }
 
 // ---------------------------------------------------------------- writing
 
-pub fn write_track(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan, sbits: u32) {
+pub fn write_track(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan) {
     let ch = ctx.x.len();
     let frames = ctx.x.first().map_or(0, |x| x.len());
     let stereo = ch == 2;
     for (b, bp) in plan.blocks.iter().enumerate() {
         let s = b * BLOCK;
         let e = (s + BLOCK).min(frames);
-        if plan.joint_on {
-            for c in 0..ch {
-                match bp.alt.as_ref().and_then(|a| a.refs[c].as_ref()) {
-                    Some(g) => {
-                        bw.write(1, 1);
-                        bw.write(u64::from(g.src), sbits);
-                        bw.write(u64::from(g.ref_ch), 4);
-                        bw.write_signed(i64::from(g.lag), 32);
-                        bw.write_signed(i64::from(g.gm), 24);
-                        bw.write(u64::from(g.gshift), 6);
-                    }
-                    None => bw.write(0, 1),
-                }
-            }
-        }
-        let (mode, sigs) = match (&bp.alt, plan.joint_on) {
-            (Some(a), true) => (a.mode, &a.signals),
-            _ => (bp.mode, &bp.signals),
-        };
         if stereo {
-            bw.write(u64::from(mode), 2);
+            bw.write(u64::from(bp.mode), 2);
         }
-        for sig in sigs {
+        for sig in &bp.signals {
             bw.write(u64::from(sig.order), 6);
             if sig.order > 0 {
                 bw.write(u64::from(LPC_PREC) - 1, 4);
                 bw.write(u64::from(sig.qshift), 5);
                 for &q in &sig.q {
                     bw.write_signed(i64::from(q), LPC_PREC);
+                }
+                if let Some(wbits) = sig.warm_wbits {
+                    bw.write(u64::from(wbits), 6);
+                    for &v in &sig.warm {
+                        bw.write_signed(v, u32::from(wbits));
+                    }
                 }
             }
             write_residual(bw, &sig.resid, &sig.rplan);
@@ -605,7 +588,7 @@ pub fn write_track(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan, sbi
 // ---------------------------------------------------------------- reading
 
 pub struct FloatMeta {
-    pub mw: u8,          // 23 or 52
+    pub mw: u8, // 23 or 52
     pub e: i16,
     pub stream_bits: u32, // 32 or 64
     pub pcm_bits: u16,    // 32 or 64 (mode 2: stream 32, pcm 64)
@@ -614,37 +597,15 @@ pub struct FloatMeta {
 pub struct TrackMeta {
     pub channels: usize,
     pub frames: usize,
-    /// Source pool (empty = no ref bits): SelfRef entries predict from this
-    /// track's own earlier samples, Cross(j) from `cross[j]`.
-    pub pool: Vec<Pool>,
     pub float: Option<FloatMeta>,
 }
 
 pub struct DecodedCore {
-    pub x: Vec<Vec<i64>>,               // code streams (I for float)
-    pub words: Option<Vec<Vec<u64>>>,   // PCM-domain float words
+    pub x: Vec<Vec<i64>>,             // code streams (I for float)
+    pub words: Option<Vec<Vec<u64>>>, // PCM-domain float words
 }
 
-/// Source stream for a pool entry: `cross[j]` for Cross(j), the track's own
-/// partially decoded `x` for SelfRef (positions are guaranteed < the current
-/// block by the causality check below).
-fn pool_slice<'a>(
-    pool: &Pool,
-    ch_ref: usize,
-    x: &'a [Vec<i64>],
-    cross: &'a [&'a [Vec<i64>]],
-) -> &'a [i64] {
-    match pool {
-        Pool::SelfRef => &x[ch_ref],
-        Pool::Cross(j) => &cross[*j as usize][ch_ref],
-    }
-}
-
-pub fn read_track(
-    r: &mut BitReader<'_>,
-    meta: &TrackMeta,
-    cross: &[&[Vec<i64>]],
-) -> Result<DecodedCore, String> {
+pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore, String> {
     let ch = meta.channels;
     let stereo = ch == 2;
     let nb = meta.frames.div_ceil(BLOCK);
@@ -661,74 +622,29 @@ pub fn read_track(
     if min_bits > r.remaining_bits() {
         return Err("declared frames exceed payload".into());
     }
-    let pool_len = meta.pool.len();
-    let sbits = src_bits(pool_len);
     let mut x = vec![vec![0i64; meta.frames]; ch];
-    let mut words = meta.float.as_ref().map(|_| vec![vec![0u64; meta.frames]; ch]);
+    let mut words = meta
+        .float
+        .as_ref()
+        .map(|_| vec![vec![0u64; meta.frames]; ch]);
 
     for b in 0..nb {
         let s = b * BLOCK;
         let e = (s + BLOCK).min(meta.frames);
         let n = e - s;
 
-        // 1. reference flags
-        let mut refs: Vec<Option<RefChoice>> = vec![None; ch];
-        if pool_len > 0 {
-            for rc in refs.iter_mut() {
-                if r.read(1) == 1 {
-                    let si = r.read(sbits) as usize;
-                    if si >= pool_len {
-                        return Err("ref source out of range".into());
-                    }
-                    let ref_ch = r.read(4) as usize;
-                    let g = RefChoice {
-                        src: si as u8,
-                        ref_ch: ref_ch as u8,
-                        lag: r.read_signed(32) as i32,
-                        gm: r.read_signed(24) as i32,
-                        gshift: r.read(6) as u8,
-                    };
-                    match meta.pool[si] {
-                        Pool::SelfRef => {
-                            if ref_ch >= ch {
-                                return Err("self ref_ch out of range".into());
-                            }
-                            // causality: gp+lag must be < s for all gp < e
-                            if i64::from(g.lag) > s as i64 - e as i64 {
-                                return Err("self ref lag reaches undecoded samples".into());
-                            }
-                        }
-                        Pool::Cross(j) => {
-                            if j as usize >= cross.len() {
-                                return Err("cross ref index out of range".into());
-                            }
-                            if ref_ch >= cross[j as usize].len() {
-                                return Err("ref_ch out of range".into());
-                            }
-                        }
-                    }
-                    *rc = Some(g);
-                }
-            }
-        }
+        // 1. stereo mode
         let mode = if stereo { r.read(2) as u8 } else { 0 };
         if r.overrun {
             return Err("truncated payload".into());
         }
 
-        let p_term = |c: usize, gp: i64, x: &[Vec<i64>]| -> i64 {
-            let Some(g) = &refs[c] else { return 0 };
-            let src = pool_slice(&meta.pool[g.src as usize], g.ref_ch as usize, x, cross);
-            ref_pred(g, src, gp + i64::from(g.lag))
-        };
-
-        // history of the coded signals = transform of y-history over W
+        // history of the coded signals = transform of x-history over W
         let mut y_hist: Vec<Vec<i64>> = vec![vec![0; MAX_ORDER]; ch];
         for c in 0..ch {
             for (i, yv) in y_hist[c].iter_mut().enumerate() {
                 let gp = s as i64 - MAX_ORDER as i64 + i as i64;
-                let xv = if gp >= 0 { x[c][gp as usize] } else { 0 };
-                *yv = xv.wrapping_sub(p_term(c, gp, &x));
+                *yv = if gp >= 0 { x[c][gp as usize] } else { 0 };
             }
         }
         let coded_hist: Vec<Vec<i64>> = if stereo {
@@ -760,9 +676,32 @@ pub fn read_track(
             } else {
                 (0u8, Vec::new())
             };
+            // warm-up block: `order` verbatim values follow the coefficients
+            // (wbits == 0 marks none — signed width was unrepresentable)
+            let mut warm_vals: Vec<i64> = Vec::new();
+            if b == 0 && order > 0 {
+                let wbits = r.read(6) as u32;
+                if wbits > 0 {
+                    for _ in 0..order {
+                        warm_vals.push(r.read_signed(wbits));
+                    }
+                }
+                if r.overrun {
+                    return Err("truncated payload".into());
+                }
+            }
             let resid = read_residual(r, n)?;
             let mut aw: Vec<i64> = hist.clone();
-            for &e in &resid {
+            for (i, &e) in resid.iter().enumerate() {
+                if i < warm_vals.len() {
+                    // warm-up position: the residual is a 0 placeholder and
+                    // the verbatim value is the sample
+                    if e != 0 {
+                        return Err("warm-up residual must be 0".into());
+                    }
+                    aw.push(warm_vals[i]);
+                    continue;
+                }
                 let mut p = 0i64;
                 let l = aw.len();
                 for (k, &c) in q.iter().enumerate() {
@@ -773,21 +712,16 @@ pub fn read_track(
             coded.push(aw[MAX_ORDER..].to_vec());
         }
 
-        // 3. inverse transform, then add references back
+        // 3. inverse stereo transform
         if stereo {
             for i in 0..n {
                 let (y0, y1) = stereo_inverse(mode, coded[0][i], coded[1][i]);
-                let p0 = p_term(0, (s + i) as i64, &x);
-                let p1 = p_term(1, (s + i) as i64, &x);
-                x[0][s + i] = y0.wrapping_add(p0);
-                x[1][s + i] = y1.wrapping_add(p1);
+                x[0][s + i] = y0;
+                x[1][s + i] = y1;
             }
         } else {
             for c in 0..ch {
-                for i in 0..n {
-                    let p = p_term(c, (s + i) as i64, &x);
-                    x[c][s + i] = coded[c][i].wrapping_add(p);
-                }
+                x[c][s..e].copy_from_slice(&coded[c]);
             }
         }
 
@@ -862,7 +796,7 @@ mod tests {
         let vals: Vec<f32> = vec![
             0.0,
             -0.0,
-            f32::from_bits(1),          // min denormal
+            f32::from_bits(1),           // min denormal
             f32::from_bits(0x007F_FFFF), // max denormal
             f32::from_bits(0x0080_0000), // min normal
             -1.0,
@@ -900,7 +834,7 @@ mod tests {
             f64::NEG_INFINITY,
             f64::from_bits(0x7FF8_0000_0000_0001),
             f64::from_bits(0x7FF0_0000_0000_0001),
-            0.1, // not f32-exact -> forces mode 3 path (mw=52)
+            0.1,                                   // not f32-exact -> forces mode 3 path (mw=52)
             f64::from_bits(0x3C10_0000_0000_0000), // ~2^-30
         ];
         let words: Vec<u64> = vals.iter().map(|v| v.to_bits()).collect();
@@ -916,7 +850,10 @@ mod tests {
             .iter()
             .all(|&v| ((v as f32) as f64).to_bits() == v.to_bits());
         assert!(all_exact);
-        let w32: Vec<u64> = vals.iter().map(|&v| u64::from((v as f32).to_bits())).collect();
+        let w32: Vec<u64> = vals
+            .iter()
+            .map(|&v| u64::from((v as f32).to_bits()))
+            .collect();
         let back = float_roundtrip(&w32, 23, 64);
         let orig: Vec<u64> = vals.iter().map(|v| v.to_bits()).collect();
         assert_eq!(back, orig);
@@ -966,16 +903,102 @@ mod tests {
             x: &xs,
             d,
             float_word_bits: 0,
-            sources: &[],
         };
         let plan = plan_track(&ctx);
         let mut bw = BW::new();
-        write_track(&mut bw, &ctx, &plan, 0);
+        write_track(&mut bw, &ctx, &plan);
         let bytes = bw.into_bytes();
         let mut r = BR::new(&bytes);
-        let meta = TrackMeta { channels: 1, frames: n, pool: Vec::new(), float: None };
-        let core = read_track(&mut r, &meta, &[]).unwrap();
+        let meta = TrackMeta {
+            channels: 1,
+            frames: n,
+            float: None,
+        };
+        let core = read_track(&mut r, &meta).unwrap();
         assert_eq!(core.x[0], x);
         assert!(!r.overrun);
+    }
+
+    #[test]
+    fn warmup_cost_and_roundtrip() {
+        // mono high-amplitude narrowband sine: block 0 picks a real LPC
+        // order and emits warm-up fields; SignalPlan::cost must equal the
+        // emitted bits exactly
+        let n = 2 * BLOCK + 500;
+        // 6 incommensurate sinusoids + noise floor: needs order >= 8
+        let x: Vec<i64> = (0..n)
+            .map(|i| {
+                let f = i as f64;
+                (2_000_000.0 * (0.020 * f).sin()
+                    + 1_500_000.0 * (0.031 * f).cos()
+                    + 1_000_000.0 * (0.043 * f).sin()
+                    + 800_000.0 * (0.057 * f).cos()
+                    + 500_000.0 * (0.071 * f).sin()
+                    + 300_000.0 * (0.089 * f).cos()
+                    + ((i * 37) % 97) as f64 * 40.0) as i64
+            })
+            .collect();
+        let xs = vec![x.clone()];
+        let ctx = TrackCtx {
+            x: &xs,
+            d: None,
+            float_word_bits: 0,
+        };
+        let plan = plan_track_with(&ctx, 8, 1);
+        let s0 = &plan.blocks[0].signals[0];
+        assert!(s0.order >= 8, "sine block 0 should pick a real order");
+        assert!(s0.warm_wbits.unwrap_or(0) >= 1);
+        assert_eq!(s0.warm.len(), s0.order as usize);
+        assert!(plan.blocks[1].signals[0].warm_wbits.is_none());
+        let mut bw = BW::new();
+        write_track(&mut bw, &ctx, &plan);
+        let emitted: u64 = plan
+            .blocks
+            .iter()
+            .flat_map(|b| b.signals.iter())
+            .map(|s| s.cost())
+            .sum();
+        assert_eq!(bw.bits, emitted, "cost() must equal emitted bits");
+        let bytes = bw.into_bytes();
+        let mut r = BR::new(&bytes);
+        let meta = TrackMeta {
+            channels: 1,
+            frames: n,
+            float: None,
+        };
+        let core = read_track(&mut r, &meta).unwrap();
+        assert_eq!(core.x[0], x);
+        assert!(!r.overrun);
+    }
+
+    #[test]
+    fn plan_track_with_parallel_is_deterministic() {
+        // multi-block stereo int signal: parallel variant-A planning must
+        // produce the exact same bits as the single-thread exact planner
+        let n = 10_000usize; // > 2 blocks
+        let mk = |seed: u64| -> Vec<i64> {
+            let mut st = seed;
+            (0..n)
+                .map(|i| {
+                    st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((i as f64 * 0.03).sin() * 100_000.0 + ((st >> 40) % 700) as f64) as i64
+                })
+                .collect()
+        };
+        let xs = vec![mk(1), mk(7)];
+        let d: Option<&[Vec<DBit>]> = None;
+        let ctx = TrackCtx {
+            x: &xs,
+            d,
+            float_word_bits: 0,
+        };
+        let a = plan_track(&ctx);
+        let b = plan_track_with(&ctx, 8, 4);
+        let wr = |p: &TrackPlan| {
+            let mut bw = BW::new();
+            write_track(&mut bw, &ctx, p);
+            bw.into_bytes()
+        };
+        assert_eq!(wr(&a), wr(&b), "threads must not change the bitstream");
     }
 }

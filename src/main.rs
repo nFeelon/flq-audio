@@ -1,29 +1,74 @@
-use flq::{
-    Input, PcmOut, Stats, TrackKind, TrackStats, decode, decode_pcm, decode_subset, encode_opts,
-    tag_blocks,
-};
+use flq::{aiff, formats, v1, wav};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
-  flq encode [--no-joint] <in1> <in2> [more ...] <out.flq>
-       inputs: .wav .aiff/.aif/.aifc .flac .mp3 .m4a/.mp4 (ALAC or AAC) .aac .ogg (Vorbis/Opus)
-       --no-joint disables all reference analysis (plain LPC/Rice coding)
-  flq decode <in.flq> [-o <dir>] [--format flac|wav] [--only <name> [<name> ...]]
-       --format picks the output of FLAC/ALAC tracks (default: flac)
-       --only decodes just the named tracks (dependencies are decoded too)
-  flq bench  [--no-joint] <in1> <in2> [more ...]   # same inputs as encode";
+  flq encode [-0|-5|-8] [-j N] [--frame N] [--no-index] <in1> <in2> [more ...] <out.flq>
+       framed lossless archive; inputs: .wav .aiff/.aif/.aifc .flac .m4a (ALAC)
+       -0/-5/-8 select the LPC search preset (default -5); -j N sets encode threads
+       --frame N sets the frame length (multiple of 4096, 4096..262144, default 16384)
+       --no-index writes no frame index (slower --only/--range decoding)
+  flq decode <in.flq> [-o <dir>] [--format flac|wav] [--only <name> [<name> ...]] [--range a:b]
+       --format picks the output format (default: wav for WAV/AIFF origins,
+       flac for FLAC/ALAC origins)
+       --only decodes just the named tracks
+       --range a:b decodes [a,b) seconds (b optional = to end)
+  flq info <in.flq>
+  flq bench [-0|-5|-8] [-j N] [--frame N] <in1> <in2> [more ...]   # encode+decode in memory";
 
-/// Split `encode`/`bench` args into (paths, joint): `--no-joint` is the only
-/// flag and may appear anywhere among the inputs.
-fn positional(args: &[String]) -> (Vec<String>, bool) {
-    let joint = !args.iter().any(|a| a == "--no-joint");
-    let pos = args.iter().filter(|a| a.as_str() != "--no-joint").cloned().collect();
-    (pos, joint)
+/// Split `encode`/`bench` args into (paths, opts). Flags may appear anywhere
+/// among the inputs: `-0`/`-5`/`-8` (last wins), `-j N` or `-jN` (N >= 1),
+/// `--frame N`, `--no-index`. Returns a usage error for a bad or missing
+/// `-j`/`--frame` value.
+fn positional(args: &[String]) -> Result<(Vec<String>, v1::enc::V1Opts), String> {
+    let mut opts = v1::enc::V1Opts::default();
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-0" => opts.preset = 0,
+            "-5" => opts.preset = 5,
+            "-8" => opts.preset = 8,
+            "--no-index" => opts.index = false,
+            "--frame" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse::<u32>().ok()) {
+                    Some(n) if n % 4096 == 0 && (4096..=262144).contains(&n) => opts.frame_len = n,
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            "-j" => {
+                i += 1;
+                let n = args.get(i).and_then(|s| s.parse::<usize>().ok());
+                match n {
+                    Some(n) if n >= 1 => opts.threads = n,
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            a if a.starts_with("-j") => match a[2..].parse::<usize>() {
+                Ok(n) if n >= 1 => opts.threads = n,
+                _ => return Err(USAGE.into()),
+            },
+            a => pos.push(a.to_string()),
+        }
+        i += 1;
+    }
+    Ok((pos, opts))
+}
+
+/// Resolved thread count for reporting (0 = available_parallelism, fallback 1).
+fn effective_threads(opts: &v1::enc::V1Opts) -> usize {
+    if opts.threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        opts.threads
+    }
 }
 
 struct Counting;
@@ -80,7 +125,13 @@ fn cpu_time() -> Option<Duration> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn GetProcessTimes(h: isize, c: *mut FileTime, e: *mut FileTime, k: *mut FileTime, u: *mut FileTime) -> i32;
+        fn GetProcessTimes(
+            h: isize,
+            c: *mut FileTime,
+            e: *mut FileTime,
+            k: *mut FileTime,
+            u: *mut FileTime,
+        ) -> i32;
     }
     let [mut c, mut e, mut k, mut u] = [(); 4].map(|_| FileTime::default());
     let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
@@ -91,60 +142,6 @@ fn cpu_time() -> Option<Duration> {
 #[cfg(not(windows))]
 fn cpu_time() -> Option<Duration> {
     None
-}
-
-#[cfg(windows)]
-fn physical_ram() -> Option<u64> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct MemStatus {
-        len: u32,
-        load: u32,
-        total: u64,
-        avail: u64,
-        total_pf: u64,
-        avail_pf: u64,
-        total_v: u64,
-        avail_v: u64,
-        avail_ev: u64,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GlobalMemoryStatusEx(s: *mut MemStatus) -> i32;
-    }
-    let mut s = MemStatus { len: std::mem::size_of::<MemStatus>() as u32, ..Default::default() };
-    let ok = unsafe { GlobalMemoryStatusEx(&mut s) };
-    (ok != 0).then_some(s.total)
-}
-
-#[cfg(not(windows))]
-fn physical_ram() -> Option<u64> {
-    None
-}
-
-/// Peak-heap estimate + warning when it is a large share of physical RAM.
-fn print_heap_note(s: &Stats) {
-    let est = s.est_encode_heap;
-    match physical_ram() {
-        Some(ram) => {
-            let share = est as f64 / ram as f64;
-            if share > 0.5 {
-                println!(
-                    "WARNING: estimated peak encode heap {:.0} MiB is {:.0}% of {:.0} MiB physical RAM",
-                    mib(est as usize),
-                    100.0 * share,
-                    mib(ram as usize)
-                );
-            } else {
-                println!(
-                    "est. peak encode heap {:.0} MiB ({:.1}% of physical RAM)",
-                    mib(est as usize),
-                    100.0 * share
-                );
-            }
-        }
-        None => println!("est. peak encode heap {:.0} MiB", mib(est as usize)),
-    }
 }
 
 struct Metrics {
@@ -162,14 +159,22 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, Metrics) {
     let v = f();
     let wall = t0.elapsed();
     let cpu = cpu_time().zip(c0).map(|(b, a)| b.saturating_sub(a));
-    (v, Metrics { wall, cpu, peak: PEAK.load(Relaxed), base })
+    (
+        v,
+        Metrics {
+            wall,
+            cpu,
+            peak: PEAK.load(Relaxed),
+            base,
+        },
+    )
 }
 
 fn sep(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
+        if i > 0 && (s.len() - i) % 3 == 0 {
             out.push(',');
         }
         out.push(ch);
@@ -181,256 +186,22 @@ fn mib(b: usize) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
-fn pct(a: i64, b: i64) -> f64 {
-    if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 }
-}
-
-fn secs(t: &TrackStats) -> f64 {
-    if t.rate == 0 { 0.0 } else { t.frames as f64 / t.rate as f64 }
-}
-
-fn kind(t: &TrackStats) -> String {
-    if let Some(m) = &t.mp3 {
-        let br = if m.bitrate_min == m.bitrate_max {
-            format!("{}k", m.bitrate_min)
-        } else {
-            format!("{}-{}k", m.bitrate_min, m.bitrate_max)
-        };
-        let mode = match m.mode {
-            1 => " [modeled]",
-            2 => " [chained]",
-            _ => "",
-        };
-        return format!("mp3 {br} {}ch {} Hz{mode}", m.channels, m.rate);
-    }
-    if t.kind == TrackKind::Raw {
-        return format!("{} [stored]", t.format);
-    }
-    let k = match (t.float_mode, t.bits) {
-        (1, _) => "f32".to_string(),
-        (2, _) => "f64 (stored as f32)".to_string(),
-        (3, _) => "f64".to_string(),
-        (_, 8) => "u8".to_string(),
-        (_, b) => format!("i{b}"),
-    };
-    format!("{} {k} {}ch {} Hz", t.format, t.channels, t.rate)
-}
-
-/// The joint-coding section: every multi-track bundle, plus a single track
-/// that used self-references (track 0 can carry self-ref savings).
-fn show_joint_section(s: &Stats) -> bool {
-    s.tracks.len() > 1 || s.tracks.iter().any(|t| t.self_ref_blocks > 0)
-}
-
-/// True when nothing in the bundle gained from shared content: no PCM
-/// reference blocks and no chained (mode-2) MP3 track.
-fn no_shared_content(s: &Stats) -> bool {
-    s.tracks
-        .iter()
-        .all(|t| t.self_ref_blocks == 0 && t.cross_ref_blocks == 0)
-        && !s
-            .tracks
-            .iter()
-            .any(|t| t.mp3.as_ref().is_some_and(|m| m.mode == 2))
-}
-
-fn print_stats(s: &Stats) {
-    let total_in: u64 = s.tracks.iter().map(|t| t.input_bytes).sum();
-    println!("Inputs");
-    for (i, t) in s.tracks.iter().enumerate() {
-        println!("  {} {:<26} {:>14} B   {:<26} {:>8.2} s", i + 1, t.name, sep(t.input_bytes), kind(t), secs(t));
-    }
-    println!("    {:<26} {:>14} B", "total", sep(total_in));
-    println!(
-        "Output .flq {:>31} B   ratio {:.3}x   ({:.2}% of inputs)",
-        sep(s.total_bytes),
-        total_in as f64 / s.total_bytes as f64,
-        100.0 * s.total_bytes as f64 / total_in as f64
-    );
-    println!("Per track (payload bytes)    independent       stereo        final   float bits       meta  % of input");
-    for (i, t) in s.tracks.iter().enumerate() {
-        let tot = t.final_bits.div_ceil(8) + t.meta_bytes;
-        let pcm_coded = matches!(t.kind, TrackKind::Wav | TrackKind::Aiff | TrackKind::Pcm);
-        let (ind, st, flt) = if !pcm_coded {
-            ("-".into(), "-".into(), "-".into())
-        } else {
-            (
-                sep(t.independent_bits / 8),
-                sep(t.stereo_bits / 8),
-                sep(t.float_bits / 8),
-            )
-        };
-        println!(
-            "  {} {:<22} {:>14} {:>12} {:>12} {:>12} {:>10} {:>10.2}%",
-            i + 1,
-            t.name,
-            ind,
-            st,
-            sep(t.final_bits / 8),
-            flt,
-            sep(t.meta_bytes),
-            100.0 * tot as f64 / t.input_bytes as f64
-        );
-    }
-    if show_joint_section(s) {
-        println!("Joint coding (reference pool per track)");
-        for (i, t) in s.tracks.iter().enumerate() {
-            let ncc = match t.max_ncc {
-                Some(v) if !t.joint_reason.contains("NCC") => format!(", max NCC {v:.3}"),
-                _ => String::new(),
-            };
-            let on = if t.joint { "on" } else { "off" };
-            let refs = if t.refs.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " [refs: {}]",
-                    t.refs.iter().map(|r| (r + 1).to_string()).collect::<Vec<_>>().join(",")
-                )
-            };
-            let saved = if t.joint {
-                format!(
-                    ", bundle +{} B (self {} blk, cross {} blk)",
-                    sep(t.stereo_bits.saturating_sub(t.final_bits) / 8),
-                    t.self_ref_blocks,
-                    t.cross_ref_blocks
-                )
-            } else {
-                String::new()
-            };
-            println!("  {} {}: {on} - {}{}{}{}", i + 1, t.name, t.joint_reason, ncc, refs, saved);
-        }
-        let saved_bits: u64 = s
-            .tracks
-            .iter()
-            .filter(|t| matches!(t.kind, TrackKind::Wav | TrackKind::Aiff | TrackKind::Pcm))
-            .map(|t| t.stereo_bits.saturating_sub(t.final_bits))
-            .sum();
-        println!(
-            "bundle: references saved {} B ({:.2}% of input)",
-            sep(saved_bits / 8),
-            100.0 * saved_bits as f64 / 8.0 / total_in as f64
-        );
-        if no_shared_content(s) {
-            println!(
-                "note: files share no exploitable content — bundling them gains only the shared header (~18 B/track)"
-            );
-        }
-    }
-    for (i, t) in s.tracks.iter().enumerate() {
-        let Some(m) = &t.mp3 else { continue };
-        let fb = 8.0 * t.input_bytes as f64;
-        let row = |label: &str, bits: u64| {
-            let bytes = if bits.is_multiple_of(8) {
-                sep(bits / 8)
-            } else {
-                format!("{:.2}", bits as f64 / 8.0)
-            };
-            println!("    {label:<22} {bytes:>12} B {:>7.3}%", 100.0 * bits as f64 / fb);
-        };
-        println!(
-            "MP3 structure {} {}: {} frames, {}ch {} Hz, {}-{} kbps, mode {} -> {} B payload ({:.2}% of file)",
-            i + 1,
-            t.name,
-            sep(m.frames),
-            m.channels,
-            m.rate,
-            m.bitrate_min,
-            m.bitrate_max,
-            m.mode,
-            sep(m.payload_bytes),
-            100.0 * m.payload_bytes as f64 / t.input_bytes as f64
-        );
-        row("raw bytes", 8 * m.raw_bytes);
-        row("headers + CRC", m.header_crc_bits);
-        row("side info", m.side_bits);
-        row("scalefactors", m.scalefac_bits);
-        row("big-values Huffman", m.bigval_code_bits);
-        row("linbits", m.linbits_bits);
-        row("sign bits", m.sign_bits);
-        row("count1 codes", m.count1_code_bits);
-        row("gaps", m.gap_bits);
-        println!(
-            "    unparsed granule-channels: {}   invalid frames: {}",
-            m.unparsed_grch, m.invalid_frames
-        );
-        if m.mode != 0 {
-            println!("    coded (ideal -log2 p, bytes) vs original bits:");
-            // (label, original bits, coded cost bits)
-            let rows: [(&str, u64, f64); 9] = [
-                ("headers + CRC", m.header_crc_bits, m.coded[0]),
-                ("side info", m.side_bits, m.coded[1]),
-                ("scalefactors", m.scalefac_bits, m.coded[2]),
-                (
-                    "coef magnitudes",
-                    m.bigval_code_bits + m.count1_code_bits + m.linbits_bits,
-                    m.coded[3] + m.coded[4] + m.coded[5],
-                ),
-                ("  zero flags", 0u64, m.coded[3]),
-                ("  unary", 0u64, m.coded[4]),
-                ("  escapes", 0u64, m.coded[5]),
-                ("signs", m.sign_bits, m.coded[6]),
-                ("gaps", m.gap_bits, m.coded[7]),
-            ];
-            for (label, orig, cost) in rows {
-                let saved = if orig == 0 {
-                    String::new()
-                } else {
-                    format!("  (-{:.1}%)", 100.0 * (1.0 - cost / orig as f64))
-                };
-                println!(
-                    "    {label:<20} {bytes:>12.1} B of {orig:>12} b{saved}",
-                    bytes = cost / 8.0,
-                    orig = sep(orig)
-                );
-            }
-            println!(
-                "    raw items + misc      {:>12.1} B   raw={:.1} misc={:.1}",
-                (m.coded[8] + m.coded[9]) / 8.0,
-                m.coded[8] / 8.0,
-                m.coded[9] / 8.0
-            );
-        }
-    }
-    let pcm_like = |t: &&TrackStats| {
-        matches!(t.kind, TrackKind::Wav | TrackKind::Aiff | TrackKind::Pcm)
-    };
-    if s.tracks.iter().any(|t| pcm_like(&t)) {
-        let sum = |f: fn(&TrackStats) -> u64| {
-            s.tracks
-                .iter()
-                .filter(|t| pcm_like(t))
-                .map(f)
-                .sum::<u64>() as i64
-        };
-        let (ind, st, fin) =
-            (sum(|t| t.independent_bits), sum(|t| t.stereo_bits), sum(|t| t.final_bits));
-        println!("Gains");
-        println!("  within-track stereo coding: {:>10} B ({:.3}% of independent)", (ind - st) / 8, pct(ind - st, ind));
-        println!("  joint coding (self+cross):  {:>10} B ({:.3}% of stereo)", (st - fin) / 8, pct(st - fin, st));
-    }
-}
-
 fn print_metrics(label: &str, m: &Metrics, audio: Option<f64>) {
-    let cpu = m.cpu.map_or("n/a".to_string(), |c| format!("{:.3} s", c.as_secs_f64()));
-    let speed = audio.map_or(String::new(), |a| format!("   speed {:.1}x realtime", a / m.wall.as_secs_f64().max(1e-9)));
+    let cpu = m
+        .cpu
+        .map_or("n/a".to_string(), |c| format!("{:.3} s", c.as_secs_f64()));
+    let speed = audio.map_or(String::new(), |a| {
+        format!(
+            "   speed {:.1}x realtime",
+            a / m.wall.as_secs_f64().max(1e-9)
+        )
+    });
     println!(
         "{label:<7} wall {:.3} s   cpu {cpu}   peak heap {:.1} MiB (baseline {:.1} MiB){speed}",
         m.wall.as_secs_f64(),
         mib(m.peak),
         mib(m.base)
     );
-}
-
-fn read_inputs(paths: &[String]) -> Result<Vec<Input>, String> {
-    paths
-        .iter()
-        .map(|p| {
-            let bytes = fs::read(p).map_err(|e| format!("{p}: {e}"))?;
-            let name = Path::new(p).file_name().and_then(|n| n.to_str()).ok_or(format!("{p}: bad file name"))?;
-            Ok(Input { name: name.to_string(), bytes })
-        })
-        .collect()
 }
 
 fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
@@ -442,109 +213,342 @@ fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn audio_secs(s: &Stats) -> f64 {
-    s.tracks.iter().map(secs).sum()
+fn v1_inputs(ins: &[String]) -> Result<Vec<v1::enc::V1Input>, String> {
+    ins.iter()
+        .map(|p| {
+            let name = Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(format!("{p}: bad file name"))?;
+            Ok(v1::enc::V1Input {
+                name: name.to_string(),
+                path: PathBuf::from(p),
+            })
+        })
+        .collect()
 }
 
-fn cmd_encode(ins: &[String], out: &str, joint: bool) -> Result<(), String> {
-    let inputs = read_inputs(ins)?;
-    let (r, m) = measure(|| encode_opts(&inputs, joint));
-    let (bytes, stats) = r?;
-    write_new(Path::new(out), &bytes)?;
-    print_stats(&stats);
-    print_heap_note(&stats);
-    print_metrics("Encode", &m, Some(audio_secs(&stats)));
+fn v1_fmt_label(m: &v1::TrackInfo) -> String {
+    let k = match (m.sample_fmt, m.bits) {
+        (1, 32) => "f32".to_string(),
+        (1, _) => "f64".to_string(),
+        (_, 8) => "u8".to_string(),
+        (_, b) => format!("i{b}"),
+    };
+    let origin = ["wav", "aiff", "flac", "alac"][m.origin as usize];
+    format!("{origin} {k} {}ch {} Hz", m.channels, m.rate)
+}
+
+fn print_stats(s: &v1::enc::V1Stats, metas: &[v1::TrackInfo]) {
+    let total_in: u64 = s.tracks.iter().map(|t| t.input_bytes).sum();
+    println!("Inputs");
+    for (i, (t, m)) in s.tracks.iter().zip(metas).enumerate() {
+        let secs = t.frames as f64 / t.rate as f64;
+        println!(
+            "  {} {:<26} {:>14} B   {:<26} {:>8.2} s",
+            i + 1,
+            t.name,
+            sep(t.input_bytes),
+            v1_fmt_label(m),
+            secs
+        );
+    }
+    println!("    {:<26} {:>14} B", "total", sep(total_in));
+    println!(
+        "Output .flq {:>31} B   ratio {:.3}x   ({:.2}% of inputs)",
+        sep(s.total_bytes),
+        total_in as f64 / s.total_bytes as f64,
+        100.0 * s.total_bytes as f64 / total_in.max(1) as f64
+    );
+    println!("Per track (frame bytes incl. headers)   coded   % of input   frames");
+    for (i, t) in s.tracks.iter().enumerate() {
+        println!(
+            "  {} {:<22} {:>14} B {:>8.2}% {:>10}",
+            i + 1,
+            t.name,
+            sep(t.coded_bytes),
+            100.0 * t.coded_bytes as f64 / t.input_bytes.max(1) as f64,
+            t.nframes
+        );
+    }
+    println!(
+        "  header+meta+index {:>14} B",
+        sep(s.header_meta_index_bytes)
+    );
+}
+
+/// `flq encode` — the framed format.
+fn cmd_encode(ins: &[String], out: &str, opts: &v1::enc::V1Opts) -> Result<(), String> {
+    if Path::new(out).exists() {
+        return Err(format!("{out} already exists, refusing to overwrite"));
+    }
+    let inputs = v1_inputs(ins)?;
+    let out_path = PathBuf::from(out);
+    let (r, m) = measure(
+        move || -> Result<(v1::enc::V1Stats, Vec<v1::TrackInfo>), String> {
+            let f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_path)
+                .map_err(|e| format!("{out}: {e}"))?;
+            let mut w = std::io::BufWriter::new(f);
+            let st = v1::enc::encode(&inputs, &mut w, opts)?;
+            w.flush().map_err(|e| format!("{out}: {e}"))?;
+            // re-read the metas for the summary print
+            let rd = v1::dec::Reader::open(std::io::BufReader::new(
+                std::fs::File::open(&out_path).map_err(|e| format!("{out}: {e}"))?,
+            ))?;
+            Ok((st, rd.tracks().to_vec()))
+        },
+    );
+    let (stats, metas) = r?;
+    print_stats(&stats, &metas);
+    println!(
+        "preset -{}, {} threads, frame {}",
+        opts.preset,
+        effective_threads(opts),
+        opts.frame_len
+    );
+    let audio: f64 = stats
+        .tracks
+        .iter()
+        .map(|t| t.frames as f64 / t.rate.max(1) as f64)
+        .sum();
+    print_metrics("Encode", &m, Some(audio));
     println!("Wrote {out}");
     Ok(())
 }
 
-fn cmd_decode(input: &str, dir: Option<&str>, fmt: PcmOut, only: Option<Vec<String>>) -> Result<(), String> {
-    let data = fs::read(input).map_err(|e| format!("{input}: {e}"))?;
-    let (r, m) = measure(|| match &only {
-        Some(names) => decode_subset(&data, fmt, names),
-        None => decode(&data, fmt),
-    });
-    let outs = r?;
+/// Default output extension for a track (origin wav/aiff -> wav,
+/// flac/alac -> flac).
+fn default_ext(m: &v1::TrackInfo) -> &'static str {
+    if m.origin >= v1::ORIGIN_FLAC {
+        "flac"
+    } else {
+        "wav"
+    }
+}
+
+/// Samples -> output file bytes in the chosen format.
+fn export(m: &v1::TrackInfo, s: &v1::dec::Samples, ext: &str) -> Result<Vec<u8>, String> {
+    if ext == "flac" {
+        let v1::dec::Samples::Int(x) = s else {
+            return Err(format!(
+                "track {}: FLAC can't hold f{}; use --format wav",
+                m.name, m.bits
+            ));
+        };
+        if m.bits == 32 {
+            return Err(format!(
+                "track {}: FLAC can't hold i32; use --format wav",
+                m.name
+            ));
+        }
+        return formats::encode_flac(x, u16::from(m.bits), u16::from(m.channels), m.rate, &m.tags);
+    }
+    let pcm = v1::dec::samples_to_pcm(s, m.bits);
+    Ok(formats::make_wav_v1(
+        &pcm,
+        m.sample_fmt,
+        m.bits,
+        m.channels,
+        m.rate,
+        m.channel_mask,
+    ))
+}
+
+/// Sample range for a `--range` option on one track: (start, len) with len
+/// left unclamped (the reader clamps); errors when start >= track length.
+fn range_bounds(
+    t: &v1::TrackInfo,
+    range: Option<(f64, Option<f64>)>,
+) -> Result<(u64, u64), String> {
+    match range {
+        Some((a, b)) => {
+            let secs = t.frames as f64 / t.rate as f64;
+            if a >= secs {
+                return Err(format!(
+                    "track {}: --range start {a} beyond track ({secs:.3} s)",
+                    t.name
+                ));
+            }
+            let start = (a * t.rate as f64) as u64;
+            let len = b.map_or(u64::MAX, |b| ((b - a).max(0.0) * t.rate as f64) as u64);
+            Ok((start, len))
+        }
+        None => Ok((0, t.frames)),
+    }
+}
+
+/// Stream a WAV export: header first (sizes known), then each frame's
+/// canonical PCM to a BufWriter through `decode_range_with`. Full-track
+/// writes verify pcm_crc incrementally. The file is written to
+/// `<out>.part` and renamed on success; on any error the .part is deleted.
+fn stream_wav_out<R: Read + Seek>(
+    rd: &mut v1::dec::Reader<R>,
+    track: usize,
+    t: &v1::TrackInfo,
+    range: Option<(f64, Option<f64>)>,
+    out: &Path,
+) -> Result<u64, String> {
+    let (start, len) = range_bounds(t, range)?;
+    let out_frames = len.min(t.frames.saturating_sub(start));
+    let align = u64::from(t.channels) * u64::from(t.bits) / 8;
+    let pcm_len = (out_frames * align) as usize;
+    let head = formats::wav_header_v1(
+        pcm_len,
+        t.sample_fmt,
+        t.bits,
+        t.channels,
+        t.rate,
+        t.channel_mask,
+    );
+    let part = PathBuf::from(format!("{}.part", out.display()));
+    let f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .map_err(|e| format!("{}: {e}", part.display()))?;
+    let mut w = BufWriter::new(f);
+    let res = (|| -> Result<(), String> {
+        w.write_all(&head)
+            .map_err(|e| format!("{}: {e}", part.display()))?;
+        let mut crc = v1::dec::Crc32::new();
+        let check = range.is_none();
+        rd.decode_range_with(track, start, len, |s| {
+            let pcm = v1::dec::samples_to_pcm(&s, t.bits);
+            if check {
+                crc.update(&pcm);
+            }
+            w.write_all(&pcm)
+                .map_err(|e| format!("{}: {e}", part.display()))
+        })?;
+        if pcm_len % 2 == 1 {
+            w.write_all(&[0])
+                .map_err(|e| format!("{}: {e}", part.display()))?;
+        }
+        w.flush().map_err(|e| format!("{}: {e}", part.display()))?;
+        if check && crc.finish() != t.pcm_crc {
+            return Err(format!("track {}: pcm_crc mismatch", t.name));
+        }
+        Ok(())
+    })();
+    drop(w);
+    match res {
+        Ok(()) => {
+            fs::rename(&part, out).map_err(|e| format!("{}: {e}", out.display()))?;
+            Ok((head.len() + pcm_len + (pcm_len & 1)) as u64)
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
+fn cmd_decode(
+    input: &str,
+    dir: Option<&str>,
+    fmt: Option<&'static str>,
+    only: Option<Vec<String>>,
+    range: Option<(f64, Option<f64>)>,
+) -> Result<(), String> {
+    let f = std::fs::File::open(input).map_err(|e| format!("{input}: {e}"))?;
+    let mut rd = v1::dec::Reader::open(BufReader::new(f))?;
+    let infos = rd.tracks().to_vec();
+    let picks: Vec<usize> = match &only {
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                infos.iter().position(|t| &t.name == n).ok_or_else(|| {
+                    let avail = infos
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("unknown track {n:?} (tracks: {avail})")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => (0..infos.len()).collect(),
+    };
     let p = Path::new(input);
     let dir = dir.map(PathBuf::from).unwrap_or_else(|| {
-        p.with_file_name(format!("{}_decoded", p.file_stem().unwrap_or_default().to_string_lossy()))
+        p.with_file_name(format!(
+            "{}_decoded",
+            p.file_stem().unwrap_or_default().to_string_lossy()
+        ))
     });
-    if let Some(o) = outs.iter().find(|o| dir.join(&o.name).exists()) {
-        return Err(format!("{} already exists, refusing to overwrite", dir.join(&o.name).display()));
+    let outname = |name: &str, ext: &str| {
+        let stem = Path::new(name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        format!("{stem}.{ext}")
+    };
+    let outs: Vec<(usize, &'static str, PathBuf)> = picks
+        .iter()
+        .map(|&i| {
+            let ext: &'static str = fmt.unwrap_or_else(|| default_ext(&infos[i]));
+            (i, ext, dir.join(outname(&infos[i].name, ext)))
+        })
+        .collect();
+    if let Some((_, _, path)) = outs.iter().find(|(_, _, p)| p.exists()) {
+        return Err(format!(
+            "{} already exists, refusing to overwrite",
+            path.display()
+        ));
     }
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for o in &outs {
-        let path = dir.join(&o.name);
-        write_new(&path, &o.bytes)?;
-        let note = if o.exact { "CRC32 OK (bit-exact)" } else { "CRC32 OK (audio verified)" };
-        println!("  {} {:>14} B  {note}", path.display(), sep(o.bytes.len() as u64));
+    let (r, m) = measure(move || -> Result<Vec<(PathBuf, u64)>, String> {
+        outs.iter()
+            .map(|&(i, ext, ref path)| {
+                let t = &infos[i];
+                if ext == "wav" {
+                    return stream_wav_out(&mut rd, i, t, range, path).map(|n| (path.clone(), n));
+                }
+                // shortcut: FLAC export stays whole-track (flacenc works in
+                // memory anyway)
+                let (start, len) = range_bounds(t, range)?;
+                let s = if range.is_some() {
+                    rd.decode_range(i, start, len)?
+                } else {
+                    rd.decode_track(i)?
+                };
+                let bytes = export(t, &s, ext)?;
+                write_new(path, &bytes)?;
+                Ok((path.clone(), bytes.len() as u64))
+            })
+            .collect()
+    });
+    let written = r?;
+    for (path, n) in &written {
+        println!(
+            "  {} {:>14} B  CRC32 OK (audio verified)",
+            path.display(),
+            sep(*n)
+        );
     }
     print_metrics("Decode", &m, None);
     Ok(())
 }
 
-fn cmd_bench(ins: &[String], joint: bool) -> Result<(), String> {
-    let inputs = read_inputs(ins)?;
-    let (r, em) = measure(|| encode_opts(&inputs, joint));
-    let (bytes, stats) = r?;
-    let (r, dm) = measure(|| decode(&bytes, PcmOut::Flac));
-    let outs = r?;
-    print_stats(&stats);
-    print_heap_note(&stats);
-    if stats.total_bytes != bytes.len() as u64 {
-        println!("WARNING: stats.total_bytes {} != container length {}", stats.total_bytes, bytes.len());
-    }
-    let audio = audio_secs(&stats);
-    print_metrics("Encode", &em, Some(audio));
-    print_metrics("Decode", &dm, Some(audio));
-    println!("Accuracy (decoded vs original file bytes)");
-    let mut ok = outs.len() == inputs.len();
-    for (i, (inp, out)) in inputs.iter().zip(&outs).enumerate() {
-        if stats.tracks[i].kind == TrackKind::Pcm {
-            // audio-exact: compare decoded samples, not file bytes
-            let a = decode_pcm(&inp.bytes);
-            let b = decode_pcm(&out.bytes);
-            let same = matches!((&a, &b), (Ok(x), Ok(y)) if x == y);
-            let tags_ok = matches!(
-                (tag_blocks(&inp.bytes), tag_blocks(&out.bytes)),
-                (Ok(x), Ok(y)) if x == y
-            );
-            let n: u64 = a
-                .as_ref()
-                .map(|v| v.3.iter().map(|c| c.len() as u64).sum())
-                .unwrap_or(0);
-            ok &= same && tags_ok;
-            println!(
-                "  {} {}: {}, {} samples identical, file re-encoded, tags {}",
-                i + 1,
-                inp.name,
-                if same && tags_ok { "audio-exact" } else { "MISMATCH" },
-                sep(n),
-                if tags_ok { "match" } else { "MISMATCH" }
-            );
-            continue;
-        }
-        let same = inp.bytes.iter().zip(&out.bytes).filter(|(a, b)| a == b).count() as u64;
-        let exact = inp.bytes == out.bytes;
-        ok &= exact;
-        println!(
-            "  {} {}: {}, {}/{} bytes identical (decoded {} B)",
-            i + 1,
-            inp.name,
-            if exact { "bit-exact" } else { "MISMATCH" },
-            sep(same),
-            sep(inp.bytes.len() as u64),
-            sep(out.bytes.len() as u64)
-        );
-    }
-    if ok { Ok(()) } else { Err("accuracy check failed".into()) }
-}
-
 /// `flq decode` option parsing (after the input path): `-o dir`,
-/// `--format flac|wav`, `--only name ...` — repeated `--only` accumulates.
+/// `--format flac|wav`, `--only name ...` — repeated `--only` accumulates —
+/// and `--range a:b` (seconds, `b` optional = to end).
 #[allow(clippy::type_complexity)]
-fn decode_opts(a: &[String]) -> Result<(Option<&str>, PcmOut, Option<Vec<String>>), String> {
-    let (mut dir, mut fmt, mut only) = (None, PcmOut::Flac, None);
+fn decode_opts(
+    a: &[String],
+) -> Result<
+    (
+        Option<&str>,
+        Option<&'static str>,
+        Option<Vec<String>>,
+        Option<(f64, Option<f64>)>,
+    ),
+    String,
+> {
+    let (mut dir, mut fmt, mut only, mut range) = (None, None, None, None);
     let mut i = 2;
     let n = a.len();
     while i < n {
@@ -555,17 +559,31 @@ fn decode_opts(a: &[String]) -> Result<(Option<&str>, PcmOut, Option<Vec<String>
             }
             "--format" if i + 1 < n => {
                 match a[i + 1].as_str() {
-                    "flac" => fmt = PcmOut::Flac,
-                    "wav" => fmt = PcmOut::Wav,
+                    "flac" => fmt = Some("flac"),
+                    "wav" => fmt = Some("wav"),
                     _ => return Err(USAGE.into()),
                 }
+                i += 2;
+            }
+            "--range" if i + 1 < n => {
+                let (a_s, b_s) = a[i + 1].split_once(':').unwrap_or((a[i + 1].as_str(), ""));
+                let a_v = a_s.parse::<f64>().map_err(|_| USAGE.to_string())?;
+                let b_v = if b_s.is_empty() {
+                    None
+                } else {
+                    Some(b_s.parse::<f64>().map_err(|_| USAGE.to_string())?)
+                };
+                if a_v < 0.0 || b_v.is_some_and(|b| b <= a_v) {
+                    return Err(USAGE.into());
+                }
+                range = Some((a_v, b_v));
                 i += 2;
             }
             "--only" => {
                 i += 1;
                 let names = only.get_or_insert_with(Vec::new);
                 let before = names.len();
-                while i < n && !matches!(a[i].as_str(), "-o" | "--format" | "--only") {
+                while i < n && !matches!(a[i].as_str(), "-o" | "--format" | "--only" | "--range") {
                     names.push(a[i].clone());
                     i += 1;
                 }
@@ -576,26 +594,141 @@ fn decode_opts(a: &[String]) -> Result<(Option<&str>, PcmOut, Option<Vec<String>
             _ => return Err(USAGE.into()),
         }
     }
-    Ok((dir, fmt, only))
+    Ok((dir, fmt, only, range))
+}
+
+fn cmd_info(input: &str) -> Result<(), String> {
+    let f = std::fs::File::open(input).map_err(|e| format!("{input}: {e}"))?;
+    let mut rd = v1::dec::Reader::open(BufReader::new(f))?;
+    println!(
+        "FLQ v1 framed archive: {} tracks, frame_len {}, index {}",
+        rd.tracks().len(),
+        rd.frame_len(),
+        if rd.has_index() { "yes" } else { "no" }
+    );
+    let infos = rd.tracks().to_vec();
+    for (i, t) in infos.iter().enumerate() {
+        let coded = rd.coded_bytes(i).map_or("-".to_string(), sep);
+        println!(
+            "  {} {:<26} {:<28} {:>8.3} s  {:>6} frames  {:>14} B coded",
+            i + 1,
+            t.name,
+            v1_fmt_label(t),
+            t.frames as f64 / t.rate as f64,
+            t.nframes,
+            coded
+        );
+    }
+    Ok(())
+}
+
+/// Per-track source samples for the bench accuracy check.
+fn source_samples(path: &str) -> Result<v1::dec::Samples, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    match formats::sniff(&bytes) {
+        formats::Sniff::Wav => {
+            let w = wav::parse(&bytes)?;
+            Ok(if w.tag == 3 {
+                v1::dec::Samples::Float(wav::channel_words(&w))
+            } else {
+                v1::dec::Samples::Int(wav::channel_ints(&w))
+            })
+        }
+        formats::Sniff::Aiff => {
+            let w = aiff::parse(&bytes)?;
+            Ok(if w.tag == 3 {
+                v1::dec::Samples::Float(wav::channel_words(&w))
+            } else {
+                v1::dec::Samples::Int(wav::channel_ints(&w))
+            })
+        }
+        _ => {
+            let (_, _, _, x) = formats::decode_pcm(&bytes)?;
+            Ok(v1::dec::Samples::Int(x))
+        }
+    }
+}
+
+/// `flq bench` — encode into memory, decode, compare with the sources.
+fn cmd_bench(ins: &[String], opts: &v1::enc::V1Opts) -> Result<(), String> {
+    let inputs = v1_inputs(ins)?;
+    let (r, em) = measure(move || {
+        let mut cur = Cursor::new(Vec::new());
+        v1::enc::encode(&inputs, &mut cur, opts).map(|st| (cur.into_inner(), st))
+    });
+    let (bytes, stats) = r?;
+    let (r, dm) = measure(|| {
+        let mut rd = v1::dec::Reader::open(Cursor::new(&bytes))?;
+        (0..rd.tracks().len())
+            .map(|t| rd.decode_track(t))
+            .collect::<Result<Vec<_>, _>>()
+    });
+    let decoded = r?;
+    let rd = v1::dec::Reader::open(Cursor::new(&bytes))?;
+    print_stats(&stats, rd.tracks());
+    println!(
+        "preset -{}, {} threads, frame {}",
+        opts.preset,
+        effective_threads(opts),
+        opts.frame_len
+    );
+    let audio: f64 = stats
+        .tracks
+        .iter()
+        .map(|t| t.frames as f64 / t.rate.max(1) as f64)
+        .sum();
+    print_metrics("Encode", &em, Some(audio));
+    print_metrics("Decode", &dm, Some(audio));
+    println!("Accuracy (decoded vs source samples)");
+    let mut ok = true;
+    for (i, p) in ins.iter().enumerate() {
+        let name = Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(p);
+        let src = source_samples(p)?;
+        let same = match (&src, &decoded[i]) {
+            (v1::dec::Samples::Int(a), v1::dec::Samples::Int(b)) => a == b,
+            (v1::dec::Samples::Float(a), v1::dec::Samples::Float(b)) => a == b,
+            _ => false,
+        };
+        ok &= same;
+        let n: u64 = decoded[i].frames() as u64 * decoded[i].channels() as u64;
+        println!(
+            "  {} {}: {}, {} samples identical",
+            i + 1,
+            name,
+            if same { "audio-exact" } else { "MISMATCH" },
+            sep(n)
+        );
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err("accuracy check failed".into())
+    }
 }
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let r = match (a.first().map(String::as_str), a.len()) {
         (Some("encode"), n) if n >= 3 => match positional(&a[1..]) {
-            (pos, joint) if pos.len() >= 2 => {
+            Ok((pos, opts)) if pos.len() >= 2 => {
                 let (ins, out) = pos.split_at(pos.len() - 1);
-                cmd_encode(ins, &out[0], joint)
+                cmd_encode(ins, &out[0], &opts)
             }
-            _ => Err(USAGE.into()),
-        },
-        (Some("decode"), n) if n >= 2 => match decode_opts(&a) {
-            Ok((dir, fmt, only)) => cmd_decode(&a[1], dir, fmt, only),
+            Ok(_) => Err(USAGE.into()),
             Err(e) => Err(e),
         },
+        (Some("decode"), n) if n >= 2 => match decode_opts(&a) {
+            Ok((dir, fmt, only, range)) => cmd_decode(&a[1], dir, fmt, only, range),
+            Err(e) => Err(e),
+        },
+        (Some("info"), 2) => cmd_info(&a[1]),
         (Some("bench"), n) if n >= 2 => match positional(&a[1..]) {
-            (pos, joint) if !pos.is_empty() => cmd_bench(&pos, joint),
-            _ => Err(USAGE.into()),
+            Ok((pos, opts)) if !pos.is_empty() => cmd_bench(&pos, &opts),
+            Ok(_) => Err(USAGE.into()),
+            Err(e) => Err(e),
         },
         _ => Err(USAGE.into()),
     };
@@ -608,85 +741,105 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flq::Mp3Stats;
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
-    }
-
-    fn tstat() -> TrackStats {
-        TrackStats {
-            name: "t".into(),
-            kind: TrackKind::Wav,
-            format: "wav".into(),
-            input_bytes: 0,
-            float_mode: 0,
-            bits: 0,
-            channels: 0,
-            rate: 0,
-            frames: 0,
-            meta_bytes: 0,
-            independent_bits: 0,
-            stereo_bits: 0,
-            final_bits: 0,
-            float_bits: 0,
-            joint: false,
-            joint_reason: String::new(),
-            max_ncc: None,
-            self_ref_blocks: 0,
-            cross_ref_blocks: 0,
-            refs: Vec::new(),
-            blocks: 0,
-            mp3: None,
-        }
-    }
-
-    fn stats(ts: Vec<TrackStats>) -> Stats {
-        Stats { tracks: ts, total_bytes: 0, est_encode_heap: 0 }
-    }
-
-    #[test]
-    fn shared_content_gating() {
-        // plain two-track bundle: section shows, "no shared content" note OK
-        let mut s = stats(vec![tstat(), tstat()]);
-        assert!(show_joint_section(&s));
-        assert!(no_shared_content(&s));
-        // a chained (mode-2) mp3 track is shared content -> suppress the note
-        s.tracks[1].mp3 = Some(Mp3Stats { mode: 2, ..Default::default() });
-        assert!(!no_shared_content(&s));
-        // reference blocks also suppress it
-        s.tracks[1].mp3 = None;
-        s.tracks[1].cross_ref_blocks = 3;
-        assert!(!no_shared_content(&s));
-
-        // single track: section hidden unless it has self-ref savings
-        let mut one = stats(vec![tstat()]);
-        assert!(!show_joint_section(&one));
-        one.tracks[0].self_ref_blocks = 2;
-        assert!(show_joint_section(&one));
-        assert!(!no_shared_content(&one));
     }
 
     #[test]
     fn decode_opts_only_accumulates() {
         // repeated --only must union the names, not drop earlier ones
         let a = args(&["decode", "f.flq", "--only", "a", "--only", "b", "c"]);
-        let (dir, fmt, only) = decode_opts(&a).unwrap();
-        assert_eq!(only.unwrap(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        assert!(dir.is_none() && fmt == PcmOut::Flac);
+        let (dir, fmt, only, range) = decode_opts(&a).unwrap();
+        assert_eq!(
+            only.unwrap(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(dir.is_none() && fmt.is_none() && range.is_none());
 
         // --only mixed with other options, in any order
         let a = args(&[
             "decode", "f.flq", "-o", "out", "--only", "a", "--format", "wav", "--only", "b",
         ]);
-        let (dir, fmt, only) = decode_opts(&a).unwrap();
+        let (dir, fmt, only, ..) = decode_opts(&a).unwrap();
         assert_eq!(only.unwrap(), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(dir, Some("out"));
-        assert!(fmt == PcmOut::Wav);
+        assert!(fmt == Some("wav"));
+
+        // --range a:b and --range a (open end)
+        let a = args(&["decode", "f.flq", "--range", "1.5:3", "--only", "x"]);
+        let (_, _, only, range) = decode_opts(&a).unwrap();
+        assert_eq!(range, Some((1.5, Some(3.0))));
+        assert_eq!(only.unwrap(), vec!["x".to_string()]);
+        let a = args(&["decode", "f.flq", "--range", "2:"]);
+        assert_eq!(decode_opts(&a).unwrap().3, Some((2.0, None)));
 
         // a bare --only (no names) is still a usage error
         assert!(decode_opts(&args(&["decode", "f.flq", "--only"])).is_err());
         assert!(decode_opts(&args(&["decode", "f.flq", "--only", "-o", "x"])).is_err());
         assert!(decode_opts(&args(&["decode", "f.flq", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn decode_corrupt_leaves_no_part() {
+        // a decode that fails mid-stream must remove the .part file and
+        // leave no output behind
+        let dir = std::env::temp_dir().join(format!("flqdec_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // small 16-bit mono WAV on disk for the encoder
+        let x: Vec<Vec<i64>> = vec![
+            (0..9000)
+                .map(|i| (8000.0 * (i as f64 * 0.05).sin()) as i64)
+                .collect(),
+        ];
+        let wav_b = formats::make_wav(&x, 16, 1, 44100);
+        let wav_p = dir.join("in.wav");
+        fs::write(&wav_p, &wav_b).unwrap();
+        let inputs = [v1::enc::V1Input {
+            name: "t.wav".into(),
+            path: wav_p,
+        }];
+        let mut cur = Cursor::new(Vec::new());
+        v1::enc::encode(
+            &inputs,
+            &mut cur,
+            &v1::enc::V1Opts {
+                preset: 8,
+                threads: 1,
+                frame_len: 4096,
+                index: true,
+            },
+        )
+        .unwrap();
+        let mut bytes = cur.into_inner();
+        // corrupt a payload byte of the last frame (offset via the index)
+        let flq_p = dir.join("t.flq");
+        let n = rd_nframes(&bytes);
+        let idx = index_off(&bytes);
+        let last_off =
+            u64::from_le_bytes(bytes[idx + (n - 1) * 8..idx + n * 8].try_into().unwrap()) as usize;
+        bytes[last_off + 20] ^= 0xFF;
+        fs::write(&flq_p, &bytes).unwrap();
+        let out_dir = dir.join("out");
+        let r = cmd_decode(
+            flq_p.to_str().unwrap(),
+            Some(out_dir.to_str().unwrap()),
+            None,
+            None,
+            None,
+        );
+        assert!(r.is_err());
+        let leftovers: Vec<_> = fs::read_dir(&out_dir)
+            .map(|d| d.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "leftover outputs: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn index_off(b: &[u8]) -> usize {
+        u64::from_le_bytes(b[16..24].try_into().unwrap()) as usize
+    }
+    fn rd_nframes(b: &[u8]) -> usize {
+        v1::dec::Reader::open(Cursor::new(b)).unwrap().tracks()[0].nframes as usize
     }
 }

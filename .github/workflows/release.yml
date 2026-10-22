@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-13, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: archive (unix)
+        if: runner.os != 'Windows'
+        run: |
+          pkg="flq-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$pkg"
+          cp "target/${{ matrix.target }}/release/flq" README.md LICENSE docs/SPEC-v1.md "dist/$pkg/"
+          tar -czf "dist/$pkg.tar.gz" -C dist "$pkg"
+      - name: archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = "flq-${env:GITHUB_REF_NAME}-${{ matrix.target }}"
+          New-Item -ItemType Directory "dist/$pkg" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/flq.exe", "README.md", "LICENSE", "docs/SPEC-v1.md" "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

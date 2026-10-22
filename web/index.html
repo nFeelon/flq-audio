@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flq player</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>flq player</h1>
+  <p class="sub">FLQ lossless audio in the browser — decode happens locally in WebAssembly.</p>
+
+  <div id="drop">
+    <p>Drop a <code>.flq</code> file here or</p>
+    <input type="file" id="file" accept=".flq">
+    <button id="sample">load sample</button>
+  </div>
+
+  <div id="err" hidden></div>
+
+  <section id="player" hidden>
+    <div id="meta"></div>
+    <table id="tracks">
+      <thead><tr>
+        <th></th><th>track</th><th>format</th><th>rate</th><th>ch</th><th>duration</th><th>pcm</th><th></th><th>mute</th><th>solo</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="ratio"></div>
+    <div id="transport">
+      <button id="play">play</button>
+      <span id="time">0:00 / 0:00</span>
+      <input type="range" id="seek" min="0" max="1000" value="0">
+    </div>
+  </section>
+</main>
+<script src="player.js"></script>
+</body>
+</html>

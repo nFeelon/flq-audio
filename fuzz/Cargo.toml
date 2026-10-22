@@ -1,0 +1,20 @@
+[package]
+name = "flq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flq = { package = "flq-audio", path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "v1_reader"
+path = "fuzz_targets/v1_reader.rs"
+test = false
+doc = false
