@@ -1,0 +1,18 @@
+[package]
+name = "flq"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "flq"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flq"
+path = "src/main.rs"
+
+[dependencies]
+flacenc = { version = "=0.5.1", default-features = false }
+miniz_oxide = "=0.9.1"
+rustfft = "=6.4.1"
+symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "isomp4", "alac"] }
