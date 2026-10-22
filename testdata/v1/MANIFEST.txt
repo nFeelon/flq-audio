@@ -1,16 +1,16 @@
 # flq v1 conformance vectors
 # name preset frame_len index ntracks tracks(frames:nframes:pcm_crc,...) file_crc32
-v1_i8_mono.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=8000:1:76e074ff crc32=736b4964
-v1_i16_stereo.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=10000:1:c8fec5f6 crc32=64e4741b
-v1_i16_stereo_p0.flq preset=0 frame_len=16384 index=1 ntracks=1 tracks=10000:1:c8fec5f6 crc32=64e4741b
-v1_i16_stereo_p8.flq preset=8 frame_len=16384 index=1 ntracks=1 tracks=10000:1:c8fec5f6 crc32=64e4741b
-v1_i24_6ch.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=4500:1:9acea7df crc32=7e3ef667
-v1_i32_stereo.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=5000:1:b1bfd58e crc32=066286f7
-v1_f32_stereo.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=5000:1:5a1780ac crc32=d4a94de3
-v1_f64_asf32.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=4000:1:443045dd crc32=d3fb4148
-v1_f64_true.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=4000:1:eb07075c crc32=fd707076
+v1_i8_mono.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=8000:1:76e074ff crc32=f56bbf40
+v1_i16_stereo.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=10000:1:c8fec5f6 crc32=e597027b
+v1_i16_stereo_p0.flq preset=0 frame_len=16384 index=1 ntracks=1 tracks=10000:1:c8fec5f6 crc32=e597027b
+v1_i16_stereo_p8.flq preset=8 frame_len=16384 index=1 ntracks=1 tracks=10000:1:c8fec5f6 crc32=e597027b
+v1_i24_6ch.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=4500:1:9acea7df crc32=529ba29c
+v1_i32_stereo.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=5000:1:b1bfd58e crc32=bba4edc3
+v1_f32_stereo.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=5000:1:5a1780ac crc32=3992d158
+v1_f64_asf32.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=4000:1:443045dd crc32=bbb7176e
+v1_f64_true.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=4000:1:eb07075c crc32=1f8463c0
 v1_one_sample.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=1:1:e486a2b2 crc32=219025b2
-v1_partial_frame.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=16507:2:28d4d1de crc32=49baa065
-v1_two_track_tags.flq preset=5 frame_len=16384 index=1 ntracks=2 tracks=4000:1:615f74d8,4000:1:d13d38cb crc32=ae90785e
-v1_frame4096.flq preset=5 frame_len=4096 index=1 ntracks=1 tracks=9000:3:e211428b crc32=00a7bd55
-v1_no_index.flq preset=5 frame_len=16384 index=0 ntracks=1 tracks=9000:1:e211428b crc32=76bb8266
+v1_partial_frame.flq preset=5 frame_len=16384 index=1 ntracks=1 tracks=16507:2:28d4d1de crc32=018c68fa
+v1_two_track_tags.flq preset=5 frame_len=16384 index=1 ntracks=2 tracks=4000:1:615f74d8,4000:1:d13d38cb crc32=998fe5a5
+v1_frame4096.flq preset=5 frame_len=4096 index=1 ntracks=1 tracks=9000:3:e211428b crc32=60b50f9c
+v1_no_index.flq preset=5 frame_len=16384 index=0 ntracks=1 tracks=9000:1:e211428b crc32=7536758e

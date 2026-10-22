@@ -116,9 +116,12 @@ ran on. Dated docs ARE committed.
 ```
 
 Reference results (47-file common set,
-`testdata/results/2026-10-22_9f25157.md`): 50.87% at frame_len 16384
-(+0.10 pp vs continuous coding), smaller than FLAC -8 on 43/47;
-148 WAV/AIFF: 55.75%, encode ≤ 53 MiB heap, decode ≤ 0.8 MiB.
+`testdata/results/2026-10-22_fullpipe.md`): 50.27% at frame_len 16384
+(+0.10 pp vs 262144-sample frames), smaller than FLAC -8 on 46/47 and than
+APE -c4000 on aggregate; TAK and OptimFROG still ahead. Older LPC32/Rice
+pipeline run: `2026-10-22_9f25157.md` (50.87%); the same numbers re-run
+on the final pipeline: `2026-10-22_recheck.md` — 148 WAV/AIFF: 54.74%,
+encode ≤ 53 MiB heap, decode 0.6 MiB at -j1 / ≤ 27 MiB at -j24.
 
 ## Known limits
 
@@ -140,13 +143,18 @@ Reference results (47-file common set,
 
 ## Layout
 
-- `src/bits.rs` — MSB-first bit IO, partitioned Rice + escape, CRC32
+- `src/bits.rs` — MSB-first bit IO, partitioned Rice + escape + rANS
+  partitions, CRC32
+- `src/rc.rs` — adaptive-binary rANS core (u16-cell Giesen-style
+  renormalization)
 - `src/wav.rs` — RIFF/WAVE parsing, prefix/PCM/suffix split
 - `src/aiff.rs` — AIFF/AIFF-C parsing to `wav::Wav` conventions, native
   PCM write-back
 - `src/formats.rs` — format sniffing, Symphonia FLAC/ALAC decode, tag
   blobs, flacenc encode + splice + re-decode verify, `decode_pcm`
-- `src/codec.rs` — float split, stereo modes, LPC, block plan/write/read
+- `src/codec.rs` — float split, stereo modes (incl. adaptive-gain 4/5),
+  LPC (orders ≤ 63, warm-up), LTP pitch pass, LMS last-mile pass, block
+  plan/write/read
 - `src/v1/` — the format: `mod.rs` header/meta/frame/index layouts +
   validation + `valid_name`, `enc.rs` streaming encoder (parallel
   frames), `dec.rs` `Reader` (index/seek, `decode_range_with`,

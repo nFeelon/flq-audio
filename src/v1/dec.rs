@@ -323,6 +323,23 @@ impl<R: Read + Seek> Reader<R> {
         track: usize,
         start: u64,
         len: u64,
+        sink: impl FnMut(Samples) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.decode_range_with_par(track, start, len, 1, sink)
+    }
+
+    /// `decode_range_with` with frame decode spread over `threads` scoped
+    /// workers when an index exists and the range spans several frames:
+    /// a window of `2*threads` frame payloads is read sequentially, decoded
+    /// in parallel, then handed to `sink` in order. Falls back to the
+    /// sequential path when `threads <= 1`, the index is absent, or the
+    /// range covers fewer than 4 frames.
+    pub fn decode_range_with_par(
+        &mut self,
+        track: usize,
+        start: u64,
+        len: u64,
+        threads: usize,
         mut sink: impl FnMut(Samples) -> Result<(), String>,
     ) -> Result<(), String> {
         let m = self
@@ -348,8 +365,55 @@ impl<R: Read + Seek> Reader<R> {
             end,
             fl,
         };
-        if let Some(ix) = &self.index {
-            let offs: Vec<u64> = ix[track][f0 as usize..=f1 as usize].to_vec();
+        if self.index.is_some() {
+            let offs: Vec<u64> =
+                self.index.as_ref().unwrap()[track][f0 as usize..=f1 as usize].to_vec();
+            if threads > 1 && offs.len() >= 4 {
+                // Bounded window: read payloads sequentially, decode on
+                // scoped workers, sink in frame order. Memory stays
+                // O(threads * frame).
+                let win = (threads * 2).max(4).min(offs.len());
+                let m = sl.m;
+                let mut w0 = 0usize;
+                while w0 < offs.len() {
+                    let w1 = (w0 + win).min(offs.len());
+                    let mut recs = Vec::with_capacity(w1 - w0);
+                    for (i, &at) in offs[w0..w1].iter().enumerate() {
+                        let f = f0 + (w0 + i) as u32;
+                        let rec = self.read_frame_at(at)?;
+                        if rec.head.track as usize != track || rec.head.frame_no != f {
+                            return Err(format!(
+                                "track {track} frame {f}: index points at track {} frame {}",
+                                rec.head.track, rec.head.frame_no
+                            ));
+                        }
+                        recs.push(rec);
+                    }
+                    let wlen = recs.len();
+                    let chunk = wlen.div_ceil(threads.min(wlen));
+                    let mut out: Vec<Option<Result<Samples, String>>> =
+                        (0..wlen).map(|_| None).collect();
+                    std::thread::scope(|sc| {
+                        for (ci, slice) in out.chunks_mut(chunk).enumerate() {
+                            let base = ci * chunk;
+                            let recs = &recs;
+                            sc.spawn(move || {
+                                for (i, slot) in slice.iter_mut().enumerate() {
+                                    let rec = &recs[base + i];
+                                    *slot = Some(decode_frame(track, m, &rec.head, &rec.payload));
+                                }
+                            });
+                        }
+                    });
+                    for (slot, rec) in out.into_iter().zip(recs.iter()) {
+                        let s =
+                            slot.ok_or_else(|| format!("track {track}: worker left slot empty"))??;
+                        feed_decoded(&sl, &rec.head, s, &mut sink)?;
+                    }
+                    w0 = w1;
+                }
+                return Ok(());
+            }
             for (i, at) in offs.iter().enumerate() {
                 let f = f0 + i as u32;
                 let rec = self.read_frame_at(*at)?;
@@ -401,6 +465,18 @@ impl<R: Read + Seek> Reader<R> {
     /// Decode samples [start, start+len) of a track (clamped to the track).
     /// No pcm_crc check — it covers the whole track; `decode_track` verifies.
     pub fn decode_range(&mut self, track: usize, start: u64, len: u64) -> Result<Samples, String> {
+        self.decode_range_par(track, start, len, 1)
+    }
+
+    /// `decode_range` with parallel frame decode — see
+    /// `decode_range_with_par` for the scheduling rules.
+    pub fn decode_range_par(
+        &mut self,
+        track: usize,
+        start: u64,
+        len: u64,
+        threads: usize,
+    ) -> Result<Samples, String> {
         let m = self
             .tracks
             .get(track)
@@ -412,7 +488,7 @@ impl<R: Read + Seek> Reader<R> {
         let cap = len.min(m.frames.saturating_sub(start)).min(MAX_RESERVE) as usize;
         let mut out_i: Vec<Vec<i64>> = vec![Vec::with_capacity(cap); ch];
         let mut out_f: Vec<Vec<u64>> = vec![Vec::with_capacity(cap); ch];
-        self.decode_range_with(track, start, len, |s| {
+        self.decode_range_with_par(track, start, len, threads, |s| {
             match s {
                 Samples::Int(v) => {
                     for (c, x) in v.iter().enumerate() {
@@ -469,6 +545,13 @@ impl<R: Read + Seek> Reader<R> {
     /// frame's canonical PCM bytes are hashed as produced, no full-track
     /// byte buffer.
     pub fn decode_track(&mut self, track: usize) -> Result<Samples, String> {
+        self.decode_track_par(track, 1)
+    }
+
+    /// `decode_track` with parallel frame decode — see
+    /// `decode_range_with_par` for the scheduling rules. pcm_crc still
+    /// verifies over the ordered stream.
+    pub fn decode_track_par(&mut self, track: usize, threads: usize) -> Result<Samples, String> {
         let m = self
             .tracks
             .get(track)
@@ -479,7 +562,7 @@ impl<R: Read + Seek> Reader<R> {
         let mut out_i: Vec<Vec<i64>> = vec![Vec::with_capacity(cap); ch];
         let mut out_f: Vec<Vec<u64>> = vec![Vec::with_capacity(cap); ch];
         let mut crc = Crc32::new();
-        self.decode_range_with(track, 0, m.frames, |s| {
+        self.decode_range_with_par(track, 0, m.frames, threads, |s| {
             crc.update(&samples_to_pcm(&s, m.bits));
             match s {
                 Samples::Int(v) => {
@@ -522,7 +605,16 @@ fn feed_frame(
     payload: &[u8],
     sink: &mut impl FnMut(Samples) -> Result<(), String>,
 ) -> Result<(), String> {
-    let s = decode_frame(sl.track, sl.m, head, payload)?;
+    feed_decoded(sl, head, decode_frame(sl.track, sl.m, head, payload)?, sink)
+}
+
+/// Pass the `[start, end)` slice of an already-decoded frame to `sink`.
+fn feed_decoded(
+    sl: &Slice<'_>,
+    head: &FrameHead,
+    s: Samples,
+    sink: &mut impl FnMut(Samples) -> Result<(), String>,
+) -> Result<(), String> {
     let base = u64::from(head.frame_no) * sl.fl;
     let lo = sl.start.saturating_sub(base) as usize;
     let hi = sl.end.saturating_sub(base) as usize;

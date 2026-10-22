@@ -12,7 +12,8 @@ const USAGE: &str = "usage:
        -0/-5/-8 select the LPC search preset (default -5); -j N sets encode threads
        --frame N sets the frame length (multiple of 4096, 4096..262144, default 16384)
        --no-index writes no frame index (slower --only/--range decoding)
-  flq decode <in.flq> [-o <dir>] [--format flac|wav] [--only <name> [<name> ...]] [--range a:b]
+  flq decode <in.flq> [-o <dir>] [-j N] [--format flac|wav] [--only <name> [<name> ...]] [--range a:b]
+       -j N sets decode threads (default: all cores; needs the frame index)
        --format picks the output format (default: wav for WAV/AIFF origins,
        flac for FLAC/ALAC origins)
        --only decodes just the named tracks
@@ -62,12 +63,17 @@ fn positional(args: &[String]) -> Result<(Vec<String>, v1::enc::V1Opts), String>
 
 /// Resolved thread count for reporting (0 = available_parallelism, fallback 1).
 fn effective_threads(opts: &v1::enc::V1Opts) -> usize {
-    if opts.threads == 0 {
+    cores(opts.threads)
+}
+
+/// Resolved worker count for decode: 0 = all cores.
+fn cores(n: usize) -> usize {
+    if n == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
     } else {
-        opts.threads
+        n
     }
 }
 
@@ -389,6 +395,7 @@ fn stream_wav_out<R: Read + Seek>(
     track: usize,
     t: &v1::TrackInfo,
     range: Option<(f64, Option<f64>)>,
+    threads: usize,
     out: &Path,
 ) -> Result<u64, String> {
     let (start, len) = range_bounds(t, range)?;
@@ -415,7 +422,7 @@ fn stream_wav_out<R: Read + Seek>(
             .map_err(|e| format!("{}: {e}", part.display()))?;
         let mut crc = v1::dec::Crc32::new();
         let check = range.is_none();
-        rd.decode_range_with(track, start, len, |s| {
+        rd.decode_range_with_par(track, start, len, threads, |s| {
             let pcm = v1::dec::samples_to_pcm(&s, t.bits);
             if check {
                 crc.update(&pcm);
@@ -452,6 +459,7 @@ fn cmd_decode(
     fmt: Option<&'static str>,
     only: Option<Vec<String>>,
     range: Option<(f64, Option<f64>)>,
+    threads: usize,
 ) -> Result<(), String> {
     let f = std::fs::File::open(input).map_err(|e| format!("{input}: {e}"))?;
     let mut rd = v1::dec::Reader::open(BufReader::new(f))?;
@@ -505,15 +513,16 @@ fn cmd_decode(
             .map(|&(i, ext, ref path)| {
                 let t = &infos[i];
                 if ext == "wav" {
-                    return stream_wav_out(&mut rd, i, t, range, path).map(|n| (path.clone(), n));
+                    return stream_wav_out(&mut rd, i, t, range, threads, path)
+                        .map(|n| (path.clone(), n));
                 }
                 // shortcut: FLAC export stays whole-track (flacenc works in
                 // memory anyway)
                 let (start, len) = range_bounds(t, range)?;
                 let s = if range.is_some() {
-                    rd.decode_range(i, start, len)?
+                    rd.decode_range_par(i, start, len, threads)?
                 } else {
-                    rd.decode_track(i)?
+                    rd.decode_track_par(i, threads)?
                 };
                 let bytes = export(t, &s, ext)?;
                 write_new(path, &bytes)?;
@@ -535,7 +544,8 @@ fn cmd_decode(
 
 /// `flq decode` option parsing (after the input path): `-o dir`,
 /// `--format flac|wav`, `--only name ...` — repeated `--only` accumulates —
-/// and `--range a:b` (seconds, `b` optional = to end).
+/// `--range a:b` (seconds, `b` optional = to end), `-j N` decode threads
+/// (0/absent = all cores; parallel frame decode needs an index).
 #[allow(clippy::type_complexity)]
 fn decode_opts(
     a: &[String],
@@ -545,10 +555,12 @@ fn decode_opts(
         Option<&'static str>,
         Option<Vec<String>>,
         Option<(f64, Option<f64>)>,
+        usize,
     ),
     String,
 > {
     let (mut dir, mut fmt, mut only, mut range) = (None, None, None, None);
+    let mut threads = 0usize;
     let mut i = 2;
     let n = a.len();
     while i < n {
@@ -579,11 +591,24 @@ fn decode_opts(
                 range = Some((a_v, b_v));
                 i += 2;
             }
+            "-j" if i + 1 < n => {
+                threads = a[i + 1]
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&t| t >= 1)
+                    .ok_or_else(|| USAGE.to_string())?;
+                i += 2;
+            }
             "--only" => {
                 i += 1;
                 let names = only.get_or_insert_with(Vec::new);
                 let before = names.len();
-                while i < n && !matches!(a[i].as_str(), "-o" | "--format" | "--only" | "--range") {
+                while i < n
+                    && !matches!(
+                        a[i].as_str(),
+                        "-o" | "-j" | "--format" | "--only" | "--range"
+                    )
+                {
                     names.push(a[i].clone());
                     i += 1;
                 }
@@ -594,7 +619,7 @@ fn decode_opts(
             _ => return Err(USAGE.into()),
         }
     }
-    Ok((dir, fmt, only, range))
+    Ok((dir, fmt, only, range, threads))
 }
 
 fn cmd_info(input: &str) -> Result<(), String> {
@@ -657,10 +682,11 @@ fn cmd_bench(ins: &[String], opts: &v1::enc::V1Opts) -> Result<(), String> {
         v1::enc::encode(&inputs, &mut cur, opts).map(|st| (cur.into_inner(), st))
     });
     let (bytes, stats) = r?;
+    let dec_threads = effective_threads(opts);
     let (r, dm) = measure(|| {
         let mut rd = v1::dec::Reader::open(Cursor::new(&bytes))?;
         (0..rd.tracks().len())
-            .map(|t| rd.decode_track(t))
+            .map(|t| rd.decode_track_par(t, dec_threads))
             .collect::<Result<Vec<_>, _>>()
     });
     let decoded = r?;
@@ -721,7 +747,7 @@ fn main() {
             Err(e) => Err(e),
         },
         (Some("decode"), n) if n >= 2 => match decode_opts(&a) {
-            Ok((dir, fmt, only, range)) => cmd_decode(&a[1], dir, fmt, only, range),
+            Ok((dir, fmt, only, range, j)) => cmd_decode(&a[1], dir, fmt, only, range, cores(j)),
             Err(e) => Err(e),
         },
         (Some("info"), 2) => cmd_info(&a[1]),
@@ -750,7 +776,7 @@ mod tests {
     fn decode_opts_only_accumulates() {
         // repeated --only must union the names, not drop earlier ones
         let a = args(&["decode", "f.flq", "--only", "a", "--only", "b", "c"]);
-        let (dir, fmt, only, range) = decode_opts(&a).unwrap();
+        let (dir, fmt, only, range, _) = decode_opts(&a).unwrap();
         assert_eq!(
             only.unwrap(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
@@ -768,11 +794,17 @@ mod tests {
 
         // --range a:b and --range a (open end)
         let a = args(&["decode", "f.flq", "--range", "1.5:3", "--only", "x"]);
-        let (_, _, only, range) = decode_opts(&a).unwrap();
+        let (_, _, only, range, _) = decode_opts(&a).unwrap();
         assert_eq!(range, Some((1.5, Some(3.0))));
         assert_eq!(only.unwrap(), vec!["x".to_string()]);
         let a = args(&["decode", "f.flq", "--range", "2:"]);
         assert_eq!(decode_opts(&a).unwrap().3, Some((2.0, None)));
+
+        // -j sets decode threads (0/absent = all cores)
+        let a = args(&["decode", "f.flq", "-j", "4", "--only", "x"]);
+        let (_, _, only, _, j) = decode_opts(&a).unwrap();
+        assert_eq!(j, 4);
+        assert_eq!(only.unwrap(), vec!["x".to_string()]);
 
         // a bare --only (no names) is still a usage error
         assert!(decode_opts(&args(&["decode", "f.flq", "--only"])).is_err());
@@ -827,6 +859,7 @@ mod tests {
             None,
             None,
             None,
+            1,
         );
         assert!(r.is_err());
         let leftovers: Vec<_> = fs::read_dir(&out_dir)

@@ -170,7 +170,8 @@ The frame's `n` samples per channel are split into blocks of 4096; the
 last block holds `n mod 4096` (1..4096) samples when nonzero. For each
 block, in order:
 
-1. **Stereo mode** — present iff `channels == 2`: 2 bits, value 0..3 (§8.2).
+1. **Stereo mode** — present iff `channels == 2`: 3 bits, value 0..5
+   (§8.2); modes 4/5 are followed by an 8-bit signed gain field.
    For `channels != 2` there is no mode field and each channel is an
    independent coded signal.
 2. **Coded signals** — 2 signals when `channels == 2`, else `channels`
@@ -191,6 +192,19 @@ Let L, R be the block's channel samples; A, B the two coded signals.
 | 1 | LS | A=L, B=L−R | L=A, R=A−B |
 | 2 | RS | A=R, B=L−R | L=A+B, R=A |
 | 3 | MS | A=mid=(L+R)>>1 (arithmetic), B=L−R | `m = 2A | (B & 1)`; L=(m+B)>>1, R=(m−B)>>1 |
+| 4 | LG | A=L, B=R−gain(L) | L=A, R=B+gain(A) |
+| 5 | RG | A=R, B=L−gain(R) | R=A, L=B+gain(A) |
+
+Modes 6–7 are reserved; a reader MUST reject them ("stereo mode N out of
+range").
+
+For modes 4/5 the mode field is followed immediately by a signed 8-bit
+**gain** field `g`. The gain operator is a quantized multiply on a 1/128
+grid:
+
+```
+gain(v) = (g·v + 64) >> 7        // wrapping i64 multiply, arithmetic shift
+```
 
 All arithmetic is wrapping 64-bit; `>>1` is an arithmetic (sign-extending)
 shift. The mode-3 inverse restores the lost low bit via `B & 1`, which is
@@ -198,8 +212,8 @@ exact: `L+R` and `L−R` always have the same parity.
 
 Note the mode also applies to the *history* transform: the coded signals'
 prediction history is the stereo transform of the reconstructed
-y-history (the previous 32 samples per channel, zero-padded before the
-frame start).
+y-history (the previous `MAX_ORDER` = 63 samples per channel,
+zero-padded before the frame start).
 
 ### 8.3 Coded signal header
 
@@ -207,12 +221,17 @@ Per coded signal, in signal order:
 
 | Field | Bits | Rule |
 |---|---|---|
-| order | 6 | LPC order `o`, `0..=32`; `> 32` rejected |
+| order | 6 | LPC order `o`, `0..=63`; `> 63` impossible (field width) |
 | prec−1 | 4 | only when `o > 0`; coefficient precision `prec = field + 1`. Reference encoder emits 14 (prec 15). `prec > 32` rejected; coefficients are read as signed `prec`-bit values and kept mod 2^16 (i16) |
 | qshift | 5 | only when `o > 0`; prediction right-shift |
 | coefficients | `o` × `prec` | only when `o > 0`; signed `prec`-bit fields, order k = 1..o |
 | wbits | 6 | only in **block 0** of a frame **and** `o > 0`; see §8.4 |
 | warm-up values | `o` × `wbits` | only when `wbits > 0`; signed `wbits`-bit fields |
+| ltp_flag | 1 | always present; `1` = LTP fields follow (§8.5a) |
+| ltp τ | 12 | only when `ltp_flag`; MUST be `> 0` |
+| ltp gain | 8 signed | only when `ltp_flag`; gain on the 1/128 grid |
+| lms_flag | 1 | always present; `1` = adaptive pass applied (§8.5b) |
+| lms step | 2 | only when `lms_flag`; index into `[2, 4, 8, 16]` |
 
 `order == 0` means "no prediction": the signal equals its residuals.
 
@@ -239,34 +258,131 @@ order > 0)`.
 
 ### 8.5 Prediction & residuals
 
+The signal header fields are followed by the coded residual stream `R`
+of length `n` (the block length). Decoding pipeline — each stage feeds
+the next:
+
+```
+R  =  partitioned read (§8.5c)
+e2 =  lms_flag ? LMS⁻¹(R)      : R            // §8.5b
+e1 =  ltp_flag ? LTP⁻¹(e2, τ, g) : e2         // §8.5a
+x_i =  e1_i + pred_i                            // LPC add-back below
+```
+
 For sample position `i` in the block (beyond any warm-up positions), let
-`aw` be the reconstructed coded signal with its 32-sample history prefix
+`aw` be the reconstructed coded signal with its 63-sample history prefix
 (history = the coded-domain previous samples; zeros before the frame
 start; at block boundaries inside the frame it is the already-decoded
 tail of the previous block, transformed to coded domain):
 
 ```
 pred = ( Σ_{k=1..o} c[k] · aw[i−k] ) >> qshift     // wrapping i64 sum, arithmetic shift
-x_i  = residual_i + pred                          // wrapping i64 add
+x_i  = e1_i + pred                                // wrapping i64 add
 ```
 
-The residual vector has length `n` (the block length). Coding:
+Residuals `i < o` in block 0 are the zero placeholders of §8.4 — that
+check happens on `e1` (after LMS/LTP inversion). The signal's
+reconstruction for the whole block feeds the next block's history inside
+the same frame.
+
+#### 8.5a LTP — long-term prediction (ltp_flag)
+
+The wire residual is the *post-LTP* stream: at encode, `e2[i] =
+e1[i] − gain(e1'[base+i−τ])` where `gain(v) = (g·v + 64) >> 7` and
+`e1'` is the reconstructed residual stream of the whole frame up to that
+point (per coded signal, positions before frame start read as 0). The
+decoder rebuilds in place, forward order:
+
+```
+e1[i] = e2[i] + gain(tap),  tap = e1[base+i−τ]   // 0 when index < 0
+```
+
+`base` is the frame-absolute position of the block start. Because the
+reconstruction is forward-sequential, taps inside the same block
+(`i−τ ≥ base`) read already-rebuilt values. τ ∈ `1..=4095` (u12 field);
+τ = 0 is rejected ("LTP lag out of range"). Note the LTP history is the
+*residual* stream — it is not affected by LMS, which sits one stage later
+and is inverted first.
+
+#### 8.5b LMS — adaptive last-mile pass (lms_flag)
+
+When `lms_flag` is set, the wire stream was produced by a two-tap
+sign-sign adaptive decorrelator; the decoder replays it exactly:
+
+```
+w1 = w2 = 0  (i32-range accumulators, clamped to ±4096)
+step = LMS_STEPS[lms_step] = [2, 4, 8, 16][idx]
+for i in 0..n:
+    s1 = R'[i−1] or 0,  s2 = R'[i−2] or 0        // previous *output* values
+    p  = (w1·s1 + w2·s2 + 512) >> 10             // wrapping i64
+    R'[i] = R[i] + p                              // output = wire + prediction
+    if R[i] != 0:                                 // adapt on the wire value's sign
+        ds = R[i] > 0 ? +step : −step
+        if s1 != 0: w1 += (s1 > 0 ? +ds : −ds); clamp ±4096
+        if s2 != 0: w2 += (s2 > 0 ? +ds : −ds); clamp ±4096
+```
+
+The encoder's forward pass is `R[i] = s[i] − p` with the same update —
+`R'` after inversion equals `s`. Weights reset at every signal start
+(every block).
+
+#### 8.5c Residual stream coding
 
 | Field | Bits | Rule |
 |---|---|---|
 | partition order `p` | 4 | `0..=8`; `2^p` MUST divide `n` |
 | per partition j (`2^p` partitions of `n_p = n >> p` residuals, in order): | | |
-| param | 5 | `0..30` = Rice parameter `k`; `31` = escape |
+| param | 6 | `0..=30` = Rice parameter `k`; `31..=61` = rANS partition with `k = param − 31`; `62` = escape; `63` reserved, rejected |
 | if Rice `k`: per residual | `unary(u>>k)` + `k` low bits of `u`, where `u = zigzag(residual)` | |
+| if rANS `k`: blob_len | 16 | number of u16 cells following |
+| if rANS `k`: cells | `16 × blob_len` | rANS state cells, payload order |
+| if rANS `k`: per residual | `k` low bits of `zigzag(residual)`, in order | |
 | if escape: width | 6 | `width ≤ 63`; `width == 0` means all `n_p` residuals are `0` |
 | if escape: per residual | `width` raw bits = low `width` bits of `zigzag(residual)` | |
 
-Residuals `i < o` in block 0 are the zero placeholders of §8.4. An escape
-with `width > 63` is an error; any read past the payload is an error
-("truncated payload").
+**rANS partition coding** (param `31..=61`, `k = param − 31`): the
+quotient sequence `q_i = zigzag(residual_i) >> k` is coded as adaptive
+unary — for each residual, `q` zero bits then a one bit — where every bit
+position uses its own adaptive binary context indexed by the run position
+`j` capped at 63 (context for bit j of the unary expansion is
+`ctx[min(j, 63)]`). Each context holds a 12-bit probability `p1` of a
+1-bit, initialized to `2048` and updated after every coded bit `b`:
 
-The signal's reconstruction for the whole block feeds the next block's
-history inside the same frame.
+```
+p1 += ((b ? 4096 : 0) − p1) >> 4;   clamp to [4, 4092]
+```
+
+The bit sequence is coded with a Giesen-style rANS over 16-bit state
+cells (`TOT = 4096`, lower bound `L = 2^24`): the encoder first walks the
+bits forward to record each bit's probability, then encodes them in
+reverse order; the decoder reads forward. Encoding a bit with frequency
+`f` and cumulant `cum` (for bit `b`: `f = b ? p1 : TOT−p1`,
+`cum = b ? TOT−p1 : 0`):
+
+```
+emit:  while x >= f << 28:  append low u16 of x;  x >>= 16
+fold:  x = (x / f) · TOT + cum + (x mod f)
+```
+
+The encoder finishes by appending 3 u16 cells of the final state,
+least-significant cell first. The decoder initializes `x` from those 3
+cells, consumes cells in reverse payload order (last-emitted-first), and
+after each symbol pulls cells while `x < 2^24`:
+
+```
+c = x mod 4096;  bit = (c >= TOT − p1)
+x = f · (x >> 12) + c − cum
+renorm: while x < 2^24 and cells remain: x = (x << 16) | next_cell
+```
+
+Bounds: `blob_len` counts u16 cells (allocation ≤ 128 KiB); a blob of
+fewer than 3 cells is an error ("rANS blob too short"); a unary run of
+more than 2^26 zeros is an error ("unary run too long") — the reference
+encoder never emits a quotient above 2^26 in an rANS partition.
+
+An escape with `width > 63` is an error; param `63` is an error
+("partition param out of range"); any read past the payload is an error
+("truncated payload").
 
 ### 8.6 Float streams (fmode 1/2/3)
 
@@ -344,7 +460,7 @@ A conforming decoder MUST reject on:
 | 3 | per-meta: `name_len > 4096`, name not UTF-8, `origin > 3`, `rate == 0`, `channels` outside `1..=16`, invalid `sample_fmt`/`bits` combination, `tags_len > 2^24`, `nframes == 0` XOR `frames == 0`, `nframes ≠ ceil(frames/frame_len)`, `nframes > frame_span/22` |
 | 4 | `index_off` nonzero but `< meta_end`; index size `> file_len − index_off`; index CRC mismatch; an index offset outside `[meta_end, index_off − 22]` |
 | 5 | per frame: bad sync, `track ≥ ntracks`, `frame_no ≥ nframes` (implied by `n` check), `n` ≠ `min(frame_len, frames − frame_no·frame_len)`, `fmode` inconsistent with `sample_fmt`/`bits`, `e ≠ 0` on `fmode 0`, record extending past file end, frame CRC mismatch |
-| 6 | payload: any read past the payload ("truncated payload"/"bitstream overrun"), `order > 32`, `prec > 32`, warm-up residual nonzero, partition `p > 8` or `2^p ∤ n`, escape `width > 63`, unary run > 2^32, `bit_len(|I|) > mw + 1`, float exponent `ef` outside `(0, emask)` |
+| 6 | payload: any read past the payload ("truncated payload"/"bitstream overrun"), stereo `mode > 5`, `order > 63` (impossible — u6 field), `prec > 32`, LTP `τ == 0`, warm-up residual nonzero, partition `p > 8` or `2^p ∤ n`, param `63`, escape `width > 63`, rANS blob < 3 cells, rANS unary run > 2^26, Rice unary run > 2^32, `bit_len(|I|) > mw + 1`, float exponent `ef` outside `(0, emask)` |
 | 7 | decoded int sample outside the declared bit range |
 | 8 | `decode_track`: `pcm_crc` mismatch |
 

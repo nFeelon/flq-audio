@@ -32,6 +32,10 @@ path = "src/lib.rs"
 name = "flq"
 path = "src/main.rs"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
 flacenc = { version = "=0.5.1", default-features = false }
 symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "isomp4", "alac"] }

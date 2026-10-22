@@ -5,8 +5,8 @@ use crate::bits::{
 };
 
 pub const BLOCK: usize = 4096;
-pub const MAX_ORDER: usize = 32;
-pub const ORDERS: [usize; 9] = [0, 1, 2, 4, 8, 12, 16, 24, 32];
+pub const MAX_ORDER: usize = 63;
+pub const ORDERS: [usize; 11] = [0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 63];
 pub const LPC_PREC: u32 = 15;
 
 // ---------------------------------------------------------------- float
@@ -122,6 +122,13 @@ fn autocorr(sig: &[i64], win: &[f64]) -> [f64; MAX_ORDER + 1] {
     let n = sig.len();
     let xw: Vec<f64> = sig.iter().zip(win).map(|(&x, &w)| x as f64 * w).collect();
     let mut r = [0f64; MAX_ORDER + 1];
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // lane-per-lag keeps each dot product's summation order identical
+        // to the scalar loop — the result is bit-exact
+        unsafe { autocorr_avx2(&xw, &mut r) };
+        return r;
+    }
     for (lag, slot) in r.iter_mut().enumerate() {
         let mut s = 0.0;
         for i in lag..n {
@@ -130,6 +137,43 @@ fn autocorr(sig: &[i64], win: &[f64]) -> [f64; MAX_ORDER + 1] {
         *slot = s;
     }
     r
+}
+
+/// r[lag] = Σ_i xw[i]·xw[i−lag] for lag 0..MAX_ORDER.
+/// AVX2: lane j of each group accumulates lag (hi−j), so the 4-term
+/// product vector is loaded contiguously and every lane keeps the
+/// scalar summation order (bit-identical to the scalar fallback).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn autocorr_avx2(xw: &[f64], r: &mut [f64; MAX_ORDER + 1]) {
+    use std::arch::x86_64::*;
+    let n = xw.len();
+    for g in 0..(MAX_ORDER + 1) / 4 {
+        let hi = 4 * g + 3; // largest lag in the group
+        // prologue: terms i in [lag, min(hi, n)) the vector loop misses
+        for lag in (4 * g)..=hi {
+            let mut s = 0.0;
+            for i in lag..hi.min(n) {
+                s += xw[i] * xw[i - lag];
+            }
+            r[lag] = s;
+        }
+        if hi >= n {
+            continue;
+        }
+        let mut acc = _mm256_setzero_pd();
+        let mut tmp = [0f64; 4];
+        unsafe {
+            for i in hi..n {
+                let m = _mm256_loadu_pd(xw.as_ptr().add(i - hi));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_set1_pd(xw[i]), m));
+            }
+            _mm256_storeu_pd(tmp.as_mut_ptr(), acc);
+        }
+        for (j, &t) in tmp.iter().enumerate() {
+            r[hi - j] += t;
+        }
+    }
 }
 
 /// Levinson–Durbin; `sol[p]` = coefficients for order p (empty when
@@ -188,6 +232,13 @@ pub struct SignalPlan {
     pub warm_wbits: Option<u8>,
     /// Verbatim warm-up values (len = `warm_wbits` count, i.e. `order`).
     pub warm: Vec<i64>,
+    /// Long-term prediction applied to `resid` before Rice coding:
+    /// Some((lag τ, quantized gain on the 1/128 grid)); the stored `resid`
+    /// is then the post-LTP residual and `rplan` covers it.
+    pub ltp: Option<(u16, i8)>,
+    /// Optional adaptive pass applied last: Some(index into LMS_STEPS).
+    /// The stored `resid` is then the post-LMS stream.
+    pub lms: Option<u8>,
     pub resid: Vec<i64>,
     pub rplan: ResidualPlan,
 }
@@ -197,6 +248,7 @@ impl SignalPlan {
     pub fn cost(&self) -> u64 {
         self.rplan.cost
             + 6
+            + 1
             + if self.order > 0 {
                 4 + 5 + u64::from(self.order) * u64::from(LPC_PREC)
             } else {
@@ -205,6 +257,9 @@ impl SignalPlan {
             + self
                 .warm_wbits
                 .map_or(0, |w| 6 + u64::from(self.order) * u64::from(w))
+            + self.ltp.map_or(0, |_| 20)
+            + 1
+            + self.lms.map_or(0, |_| 2)
     }
 }
 
@@ -263,6 +318,8 @@ fn eval_order(w: &[i64], n: usize, o: usize, qshift: u8, q: Vec<i16>, warm: usiz
         q,
         warm_wbits,
         warm: warm_vals,
+        ltp: None,
+        lms: None,
         resid,
         rplan: rp,
     }
@@ -287,6 +344,8 @@ fn plan_signal_win(w: &[i64], n: usize, preset: u8, win: &[f64], warm: bool) -> 
             q: Vec::new(),
             warm_wbits: None,
             warm: Vec::new(),
+            ltp: None,
+            lms: None,
             resid: r0,
             rplan: rp,
         }
@@ -397,18 +456,114 @@ fn mid(a: &[i64], b: &[i64]) -> Vec<i64> {
         .collect()
 }
 
-/// Coded signal pair for a stereo mode over any window: 0 LR, 1 LS, 2 RS, 3 MS.
-fn stereo_forward(mode: u8, y0: &[i64], y1: &[i64]) -> (Vec<i64>, Vec<i64>) {
+/// Apply a quantized stereo gain: round(g·v / 128) with wrapping
+/// arithmetic — identical on encode and decode, so wrap-around cancels.
+#[inline]
+fn apply_gain(g: i8, v: i64) -> i64 {
+    (i64::from(g).wrapping_mul(v).wrapping_add(64)) >> 7
+}
+
+/// Quantized gain minimizing Σ|b − g·a|² for `a` kept / side `b − g·a`:
+/// g = Σab/Σa² on a 1/128 grid, clamped to an i8. Returns 0 when `a` is
+/// silent (the gain mode then degrades to a fixed mode on equal cost).
+fn gain_coef(a: &[i64], b: &[i64]) -> i8 {
+    let (mut num, mut den) = (0i128, 0i128);
+    for (&x, &y) in a.iter().zip(b) {
+        num += x as i128 * y as i128;
+        den += x as i128 * x as i128;
+    }
+    if den == 0 {
+        return 0;
+    }
+    ((num * 128) / den).clamp(-128, 127) as i8
+}
+
+// ------------------------------------------------------------------ LMS
+//
+// Optional last-mile decorrelator on the wire residual (WavPack-style
+// sign-sign adaptive weights): d[i] = s[i] − round((w1·s[i−1] +
+// w2·s[i−2]) / 2^10), weights move ±step on sign agreement. Pure integer
+// and replayed identically by the decoder. `step` indexes LMS_STEPS.
+
+pub const LMS_STEPS: [i64; 4] = [2, 4, 8, 16];
+const LMS_SHIFT: u32 = 10;
+const LMS_WMAX: i64 = 1 << 12;
+
+fn lms_forward(s: &[i64], step: i64) -> Vec<i64> {
+    let (mut w1, mut w2) = (0i64, 0i64);
+    let mut e = Vec::with_capacity(s.len());
+    for (i, &v) in s.iter().enumerate() {
+        let s1 = if i >= 1 { s[i - 1] } else { 0 };
+        let s2 = if i >= 2 { s[i - 2] } else { 0 };
+        let p = (w1
+            .wrapping_mul(s1)
+            .wrapping_add(w2.wrapping_mul(s2))
+            .wrapping_add(512))
+            >> LMS_SHIFT;
+        let d = v.wrapping_sub(p);
+        e.push(d);
+        if d != 0 {
+            let ds = if d > 0 { step } else { -step };
+            if s1 != 0 {
+                w1 = (w1 + if s1 > 0 { ds } else { -ds }).clamp(-LMS_WMAX, LMS_WMAX);
+            }
+            if s2 != 0 {
+                w2 = (w2 + if s2 > 0 { ds } else { -ds }).clamp(-LMS_WMAX, LMS_WMAX);
+            }
+        }
+    }
+    e
+}
+
+fn lms_inverse(e: &[i64], step: i64) -> Vec<i64> {
+    let (mut w1, mut w2) = (0i64, 0i64);
+    let mut s = Vec::with_capacity(e.len());
+    for (i, &d) in e.iter().enumerate() {
+        let s1 = if i >= 1 { s[i - 1] } else { 0 };
+        let s2 = if i >= 2 { s[i - 2] } else { 0 };
+        let p = (w1
+            .wrapping_mul(s1)
+            .wrapping_add(w2.wrapping_mul(s2))
+            .wrapping_add(512))
+            >> LMS_SHIFT;
+        s.push(d.wrapping_add(p));
+        if d != 0 {
+            let ds = if d > 0 { step } else { -step };
+            if s1 != 0 {
+                w1 = (w1 + if s1 > 0 { ds } else { -ds }).clamp(-LMS_WMAX, LMS_WMAX);
+            }
+            if s2 != 0 {
+                w2 = (w2 + if s2 > 0 { ds } else { -ds }).clamp(-LMS_WMAX, LMS_WMAX);
+            }
+        }
+    }
+    s
+}
+
+/// `other` minus the gained `kept`: side channel for modes 4/5.
+fn gain_side(kept: &[i64], other: &[i64], g: i8) -> Vec<i64> {
+    other
+        .iter()
+        .zip(kept)
+        .map(|(&o, &k)| o.wrapping_sub(apply_gain(g, k)))
+        .collect()
+}
+
+/// Coded signal pair for a stereo mode over any window: 0 LR, 1 LS, 2 RS,
+/// 3 MS, 4 L + R−g·L, 5 R + L−g·R (`g` only read for 4/5).
+fn stereo_forward(mode: u8, g: i8, y0: &[i64], y1: &[i64]) -> (Vec<i64>, Vec<i64>) {
     match mode {
         1 => (y0.to_vec(), sub(y0, y1)),
         2 => (y1.to_vec(), sub(y0, y1)),
         3 => (mid(y0, y1), sub(y0, y1)),
+        4 => (y0.to_vec(), gain_side(y0, y1, g)),
+        5 => (y1.to_vec(), gain_side(y1, y0, g)),
         _ => (y0.to_vec(), y1.to_vec()),
     }
 }
 
 /// Inverse of `stereo_forward` for one sample.
-fn stereo_inverse(mode: u8, a: i64, b: i64) -> (i64, i64) {
+fn stereo_inverse(mode: u8, g: i8, a: i64, b: i64) -> (i64, i64) {
     match mode {
         1 => (a, a.wrapping_sub(b)),
         2 => (b.wrapping_add(a), a),
@@ -416,16 +571,22 @@ fn stereo_inverse(mode: u8, a: i64, b: i64) -> (i64, i64) {
             let mid = a.wrapping_mul(2) | (b & 1);
             (mid.wrapping_add(b) >> 1, mid.wrapping_sub(b) >> 1)
         }
+        4 => (a, b.wrapping_add(apply_gain(g, a))),
+        5 => (b.wrapping_add(apply_gain(g, a)), a),
         _ => (a, b),
     }
 }
 
-fn mode_of(mode: u8, l: usize, r: usize, m: usize, s: usize) -> (usize, usize) {
+/// Index pair into the per-block plan pool
+/// [L=0, R=1, side=2, mid=3, gain-side-R=4, gain-side-L=5].
+fn mode_of(mode: u8) -> (usize, usize) {
     match mode {
-        1 => (l, s),
-        2 => (r, s),
-        3 => (m, s),
-        _ => (l, r),
+        1 => (0, 2),
+        2 => (1, 2),
+        3 => (3, 2),
+        4 => (0, 4),
+        5 => (1, 5),
+        _ => (0, 1),
     }
 }
 
@@ -439,6 +600,8 @@ pub struct TrackCtx<'a> {
 
 pub struct BlockPlan {
     pub mode: u8,
+    /// Quantized stereo gain for modes 4/5 (unused otherwise).
+    pub gain: i8,
     pub signals: Vec<SignalPlan>,
 }
 
@@ -450,42 +613,79 @@ pub struct TrackPlan {
 /// the sequential loop (cheap copy) rather than kept.
 struct VarA {
     mode_a: u8,
+    gain_a: i8,
     sigs_a: Vec<SignalPlan>,
 }
 
 /// One block's plan; pure function of the input streams — safe to compute
 /// in parallel across blocks.
-fn variant_a(ctx: &TrackCtx<'_>, stereo: bool, s: usize, e: usize, preset: u8) -> VarA {
+fn variant_a(
+    ctx: &TrackCtx<'_>,
+    stereo: bool,
+    s: usize,
+    e: usize,
+    preset: u8,
+    win: &[f64],
+) -> VarA {
     let n = e - s;
     let w: Vec<Vec<i64>> = ctx.x.iter().map(|x| window(x, s, e)).collect();
-    let win = tukey(n);
     let warm = s == 0;
-    let ps = |wc: &[i64]| plan_signal_win(wc, n, preset, &win, warm);
+    let ps = |wc: &[i64]| plan_signal_win(wc, n, preset, win, warm);
     let raw: Vec<SignalPlan> = w.iter().map(|wc| ps(wc)).collect();
-    let (mode_a, sigs_a) = if stereo {
+    let (mode_a, gain_a, sigs_a) = if stereo {
         let sig_s = ps(&sub(&w[0], &w[1]));
         let sig_m = ps(&mid(&w[0], &w[1]));
-        let (c0, c1, cs, cm) = (raw[0].cost(), raw[1].cost(), sig_s.cost(), sig_m.cost());
-        let modes = [c0 + c1, c0 + cs, c1 + cs, cm + cs];
+        // adaptive-gain sides: s = other - round(g·kept), g on a 1/128
+        // grid. A near-zero gain degenerates to a plain side already
+        // covered by modes 1-3 — skip the two extra signal plans then.
+        let g4 = gain_coef(&w[0], &w[1]); // keep L, side = R - g·L
+        let g5 = gain_coef(&w[1], &w[0]); // keep R, side = L - g·R
+        let sig_gr = (g4.abs() >= 4).then(|| ps(&gain_side(&w[0], &w[1], g4)));
+        let sig_gl = (g5.abs() >= 4).then(|| ps(&gain_side(&w[1], &w[0], g5)));
+        let c = [
+            raw[0].cost(),
+            raw[1].cost(),
+            sig_s.cost(),
+            sig_m.cost(),
+            sig_gr.as_ref().map_or(u64::MAX, SignalPlan::cost),
+            sig_gl.as_ref().map_or(u64::MAX, SignalPlan::cost),
+        ];
+        // +8 on modes 4/5 = the gain field those modes carry on the wire
+        let modes = [
+            c[0] + c[1],
+            c[0] + c[2],
+            c[1] + c[2],
+            c[3] + c[2],
+            c[0].saturating_add(c[4]).saturating_add(8),
+            c[1].saturating_add(c[5]).saturating_add(8),
+        ];
         let m = modes
             .iter()
             .enumerate()
             .min_by_key(|&(_, &c)| c)
             .map(|(i, _)| i)
             .unwrap();
-        let mut it = raw.into_iter();
-        let (l, r) = (it.next().unwrap(), it.next().unwrap());
-        let sigs = match mode_of(m as u8, 0, 1, 2, 3) {
-            (0, 1) => vec![l, r],
-            (0, 3) => vec![l, sig_s],
-            (1, 3) => vec![r, sig_s],
-            _ => vec![sig_m, sig_s],
+        let mut pool: Vec<Option<SignalPlan>> = raw
+            .into_iter()
+            .map(Some)
+            .chain([Some(sig_s), Some(sig_m), sig_gr, sig_gl])
+            .collect();
+        let (i, j) = mode_of(m as u8);
+        let sigs = vec![pool[i].take().unwrap(), pool[j].take().unwrap()];
+        let gain = match m {
+            4 => g4,
+            5 => g5,
+            _ => 0,
         };
-        (m as u8, sigs)
+        (m as u8, gain, sigs)
     } else {
-        (0u8, raw)
+        (0u8, 0, raw)
     };
-    VarA { mode_a, sigs_a }
+    VarA {
+        mode_a,
+        gain_a,
+        sigs_a,
+    }
 }
 
 // Kept as the exact preset-8/single-thread entry point (tests);
@@ -505,11 +705,21 @@ pub fn plan_track_with(ctx: &TrackCtx<'_>, preset: u8, threads: usize) -> TrackP
     let nb = frames.div_ceil(BLOCK);
     let mut plans = Vec::with_capacity(nb);
 
-    // variant A for all blocks — independent, parallelized over chunks
+    // variant A for all blocks — independent, parallelized over chunks.
+    // The Tukey window depends only on block length: hoist it (full +
+    // tail) instead of recomputing ~2000 cos() per block.
+    let win_full = tukey(BLOCK.min(frames.max(1)));
+    let tail = frames % BLOCK;
+    let win_tail = if tail > 0 { tukey(tail) } else { Vec::new() };
     let va_at = |b: usize| {
         let s = b * BLOCK;
         let e = (s + BLOCK).min(frames);
-        variant_a(ctx, stereo, s, e, preset)
+        let win = if e - s == win_full.len() {
+            &win_full
+        } else {
+            &win_tail
+        };
+        variant_a(ctx, stereo, s, e, preset, win)
     };
     let vas: Vec<VarA> = if threads > 1 && nb > 1 {
         let chunk = nb.div_ceil(threads.min(nb));
@@ -532,11 +742,150 @@ pub fn plan_track_with(ctx: &TrackCtx<'_>, preset: u8, threads: usize) -> TrackP
     for va in vas {
         plans.push(BlockPlan {
             mode: va.mode_a,
+            gain: va.gain_a,
             signals: va.sigs_a,
         });
     }
 
+    // Long-term prediction post-pass: for each coded signal in each block,
+    // pitch-predict the LPC residual (e[n] -= round(g·e[n−τ])) when it pays
+    // for its 21-bit header. History = the reconstructed residual stream
+    // (pre-LTP values), capped at the last LTP_MAX_LAG samples — identical
+    // on encode and decode.
+    // Long-term prediction post-pass: for each coded signal in each block,
+    // pitch-predict the LPC residual (e[n] -= round(g·e[n−τ])) when it pays
+    // for its 21-bit header. `hist[s]` carries the reconstructed residual
+    // stream (pre-LTP values — the decoder sees exactly these), trimmed to
+    // the deepest usable lag.
+    let nsig = plans.first().map_or(0, |b| b.signals.len());
+    let mut hist: Vec<Vec<i64>> = vec![Vec::new(); nsig];
+    for bp in plans.iter_mut() {
+        for (si, sig) in bp.signals.iter_mut().enumerate() {
+            let base = hist[si].len();
+            hist[si].extend_from_slice(&sig.resid);
+            if let Some((tau, g, e2, rp2)) = ltp_try(&hist[si], base, sig.rplan.cost) {
+                sig.ltp = Some((tau, g));
+                sig.resid = e2;
+                sig.rplan = rp2;
+            }
+            let hl = hist[si].len();
+            if hl > LTP_HIST {
+                hist[si].drain(..hl - LTP_HIST);
+            }
+            // adaptive last-mile pass on the (possibly post-LTP) residual;
+            // the u2 step field must be repaid. Step choice probes a
+            // strided subsample — exact cost only for the winning step.
+            if sig.rplan.cost > 4096 {
+                let probe: Vec<i64> = sig.resid.iter().step_by(4).copied().collect();
+                let mut si_best = (0u8, u64::MAX);
+                for (idx, &step) in LMS_STEPS.iter().enumerate() {
+                    let ep = lms_forward(&probe, step);
+                    let rp = plan_residual(&ep);
+                    if rp.cost < si_best.1 {
+                        si_best = (idx as u8, rp.cost);
+                    }
+                }
+                let e3 = lms_forward(&sig.resid, LMS_STEPS[si_best.0 as usize]);
+                let rp3 = plan_residual(&e3);
+                if rp3.cost + 2 < sig.rplan.cost {
+                    sig.lms = Some(si_best.0);
+                    sig.resid = e3;
+                    sig.rplan = rp3;
+                }
+            }
+        }
+    }
+
     TrackPlan { blocks: plans }
+}
+
+/// LTP history kept for taps; the τ field is 12 bits, lags are also
+/// capped well below that for cost/benefit.
+const LTP_HIST: usize = 4096;
+const LTP_MAX_LAG: usize = 2048;
+
+/// Try long-term prediction of the block at `stream[base..]` — `stream`
+/// is the reconstructed residual stream (blocks before `base` are
+/// history). Taps read `stream[j − τ]`; position j ∈ [base, end).
+///
+/// Returns `(τ, g, resid2, rplan2)` when the re-planned post-LTP residual
+/// beats `old_cost` by more than the 20-bit LTP header.
+///
+/// Search: normalized correlation over τ ∈ [32, min(2048, base)] on a
+/// decimated grid (τ step 8, sample stride 8), then an exact
+/// gain/residual-plan evaluation at τ0−1, τ0, τ0+1.
+fn ltp_try(
+    stream: &[i64],
+    base: usize,
+    old_cost: u64,
+) -> Option<(u16, i8, Vec<i64>, ResidualPlan)> {
+    let n = stream.len() - base;
+    let tau_max = LTP_MAX_LAG.min(base);
+    if tau_max < 32 || n < 64 {
+        return None;
+    }
+    // coarse scan: normalized |correlation| on a strided grid
+    let mut best: Option<(f64, usize)> = None;
+    let mut tau = 32usize;
+    while tau <= tau_max {
+        let (mut num, mut d1, mut d2) = (0f64, 0f64, 0f64);
+        let mut i = base;
+        while i < stream.len() {
+            let a = stream[i] as f64;
+            let b = stream[i - tau] as f64;
+            num += a * b;
+            d1 += a * a;
+            d2 += b * b;
+            i += 8;
+        }
+        let score = if d1 > 0.0 && d2 > 0.0 {
+            num.abs() / (d1.sqrt() * d2.sqrt())
+        } else {
+            0.0
+        };
+        if best.is_none_or(|(bs, _)| score > bs) {
+            best = Some((score, tau));
+        }
+        tau += 8;
+    }
+    let (score, tau0) = best?;
+    if score < 0.25 {
+        return None; // no real periodicity — skip the exact pass
+    }
+    let mut out: Option<(u16, i8, Vec<i64>, ResidualPlan, u64)> = None;
+    for tau_c in [tau0.saturating_sub(1), tau0, (tau0 + 1).min(tau_max)] {
+        if tau_c == 0 || tau_c > tau_max {
+            continue;
+        }
+        let (mut num, mut den) = (0i128, 0i128);
+        for i in base..stream.len() {
+            let b = stream[i - tau_c];
+            num += stream[i] as i128 * b as i128;
+            den += b as i128 * b as i128;
+        }
+        if den == 0 {
+            continue;
+        }
+        let g = ((num * 128) / den).clamp(-128, 127) as i8;
+        if g == 0 {
+            continue;
+        }
+        let e2: Vec<i64> = (0..n)
+            .map(|i| stream[base + i].wrapping_sub(apply_gain(g, stream[base + i - tau_c])))
+            .collect();
+        let rp2 = plan_residual(&e2);
+        let c2 = rp2.cost;
+        if out.as_ref().is_none_or(|o| c2 < o.4) {
+            out = Some((tau_c as u16, g, e2, rp2, c2));
+        }
+    }
+    let (tau, g, e2, rp2, total) = out?;
+    // the 20-bit LTP header (τ u12 + g i8) must be more than repaid
+    if total + 20 < old_cost {
+        Some((tau, g, e2, rp2))
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------- writing
@@ -549,7 +898,10 @@ pub fn write_track(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan) {
         let s = b * BLOCK;
         let e = (s + BLOCK).min(frames);
         if stereo {
-            bw.write(u64::from(bp.mode), 2);
+            bw.write(u64::from(bp.mode), 3);
+            if bp.mode >= 4 {
+                bw.write_signed(i64::from(bp.gain), 8);
+            }
         }
         for sig in &bp.signals {
             bw.write(u64::from(sig.order), 6);
@@ -565,6 +917,18 @@ pub fn write_track(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan) {
                         bw.write_signed(v, u32::from(wbits));
                     }
                 }
+            }
+            // LTP flag + fields (τ u12, g i8) — the stored residual is
+            // then the post-LTP stream
+            bw.write(sig.ltp.is_some() as u64, 1);
+            if let Some((tau, g)) = sig.ltp {
+                bw.write(u64::from(tau), 12);
+                bw.write_signed(i64::from(g), 8);
+            }
+            // LMS flag + u2 step index; the stored residual is post-LMS
+            bw.write(sig.lms.is_some() as u64, 1);
+            if let Some(si) = sig.lms {
+                bw.write(u64::from(si), 2);
             }
             write_residual(bw, &sig.resid, &sig.rplan);
         }
@@ -627,17 +991,31 @@ pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore
         .float
         .as_ref()
         .map(|_| vec![vec![0u64; meta.frames]; ch]);
+    // reconstructed-residual history per coded signal, for LTP taps
+    let mut resid_hist: Vec<Vec<i64>> = vec![Vec::new(); nsig];
 
     for b in 0..nb {
         let s = b * BLOCK;
         let e = (s + BLOCK).min(meta.frames);
         let n = e - s;
 
-        // 1. stereo mode
-        let mode = if stereo { r.read(2) as u8 } else { 0 };
+        // 1. stereo mode (u3; modes 4/5 carry an 8-bit quantized gain)
+        let mode = if stereo { r.read(3) as u8 } else { 0 };
         if r.overrun {
             return Err("truncated payload".into());
         }
+        if mode > 5 {
+            return Err(format!("stereo mode {mode} out of range"));
+        }
+        let gain = if mode >= 4 {
+            let g = r.read_signed(8) as i8;
+            if r.overrun {
+                return Err("truncated payload".into());
+            }
+            g
+        } else {
+            0
+        };
 
         // history of the coded signals = transform of x-history over W
         let mut y_hist: Vec<Vec<i64>> = vec![vec![0; MAX_ORDER]; ch];
@@ -648,7 +1026,7 @@ pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore
             }
         }
         let coded_hist: Vec<Vec<i64>> = if stereo {
-            let (a, b) = stereo_forward(mode, &y_hist[0], &y_hist[1]);
+            let (a, b) = stereo_forward(mode, gain, &y_hist[0], &y_hist[1]);
             vec![a, b]
         } else {
             y_hist.clone()
@@ -657,7 +1035,7 @@ pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore
         // 2. coded signals
         let nsig = if stereo { 2 } else { ch };
         let mut coded: Vec<Vec<i64>> = Vec::with_capacity(nsig);
-        for hist in coded_hist.iter().take(nsig) {
+        for (si, hist) in coded_hist.iter().take(nsig).enumerate() {
             let order = r.read(6) as usize;
             if order > MAX_ORDER {
                 return Err("LPC order out of range".into());
@@ -690,7 +1068,62 @@ pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore
                     return Err("truncated payload".into());
                 }
             }
-            let resid = read_residual(r, n)?;
+            // LTP: flag, then τ (u12) + gain (i8). The residual on the wire
+            // is the post-LTP stream; taps read the reconstructed residual
+            // history (positions before the stream read as 0).
+            let ltp = if r.read(1) == 1 {
+                let tau = r.read(12) as usize;
+                let g = r.read_signed(8) as i8;
+                if r.overrun {
+                    return Err("truncated payload".into());
+                }
+                if tau == 0 {
+                    return Err("LTP lag out of range".into());
+                }
+                Some((tau, g))
+            } else {
+                if r.overrun {
+                    return Err("truncated payload".into());
+                }
+                None
+            };
+            // LMS: flag + u2 step index (LMS_STEPS). The wire residual is
+            // post-LMS — invert it before the LTP reconstruction below.
+            let lms = if r.read(1) == 1 {
+                let si = r.read(2) as usize;
+                if r.overrun {
+                    return Err("truncated payload".into());
+                }
+                Some(LMS_STEPS[si])
+            } else {
+                if r.overrun {
+                    return Err("truncated payload".into());
+                }
+                None
+            };
+            let mut resid = read_residual(r, n)?;
+            if let Some(step) = lms {
+                resid = lms_inverse(&resid, step);
+            }
+            if let Some((tau, g)) = ltp {
+                let rh = &resid_hist[si];
+                for i in 0..n {
+                    let j = rh.len() as i64 + i as i64 - tau as i64;
+                    let tap = if j < 0 {
+                        0
+                    } else if (j as usize) < rh.len() {
+                        rh[j as usize]
+                    } else {
+                        resid[i - tau]
+                    };
+                    resid[i] = resid[i].wrapping_add(apply_gain(g, tap));
+                }
+            }
+            resid_hist[si].extend_from_slice(&resid);
+            let hl = resid_hist[si].len();
+            if hl > LTP_HIST {
+                resid_hist[si].drain(..hl - LTP_HIST);
+            }
             let mut aw: Vec<i64> = hist.clone();
             for (i, &e) in resid.iter().enumerate() {
                 if i < warm_vals.len() {
@@ -715,7 +1148,7 @@ pub fn read_track(r: &mut BitReader<'_>, meta: &TrackMeta) -> Result<DecodedCore
         // 3. inverse stereo transform
         if stereo {
             for i in 0..n {
-                let (y0, y1) = stereo_inverse(mode, coded[0][i], coded[1][i]);
+                let (y0, y1) = stereo_inverse(mode, gain, coded[0][i], coded[1][i]);
                 x[0][s + i] = y0;
                 x[1][s + i] = y1;
             }
@@ -872,19 +1305,22 @@ mod tests {
             (i64::from(i32::MIN), i64::from(i32::MAX)),
             (5i64, 4),
         ] {
-            for mode in 0..4u8 {
-                let (a, b) = stereo_forward(mode, &[l], &[r]);
-                let (l2, r2) = stereo_inverse(mode, a[0], b[0]);
-                assert_eq!((l, r), (l2, r2), "mode {mode} ({l},{r})");
+            for mode in 0..6u8 {
+                for g in [0i8, 96, -64, 127, -128] {
+                    let (a, b) = stereo_forward(mode, g, &[l], &[r]);
+                    let (l2, r2) = stereo_inverse(mode, g, a[0], b[0]);
+                    assert_eq!((l, r), (l2, r2), "mode {mode} g{g} ({l},{r})");
+                }
             }
         }
         // random sweep
         for _ in 0..10_000 {
             let l = (lcg() as i32) as i64 - (1i64 << 31);
             let r = (lcg() as i32) as i64 - (1i64 << 31);
-            for mode in 0..4u8 {
-                let (a, b) = stereo_forward(mode, &[l], &[r]);
-                let (l2, r2) = stereo_inverse(mode, a[0], b[0]);
+            let g = (lcg() % 256) as u8 as i8;
+            for mode in 0..6u8 {
+                let (a, b) = stereo_forward(mode, g, &[l], &[r]);
+                let (l2, r2) = stereo_inverse(mode, g, a[0], b[0]);
                 assert_eq!((l, r), (l2, r2));
             }
         }
@@ -1000,5 +1436,22 @@ mod tests {
             bw.into_bytes()
         };
         assert_eq!(wr(&a), wr(&b), "threads must not change the bitstream");
+    }
+
+    #[test]
+    fn lms_roundtrip() {
+        let mut st = 0x9E3779B97F4A7C15u64;
+        let mut s = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s.push(((st >> 33) % 2000) as i64 - 1000);
+        }
+        for &step in &LMS_STEPS {
+            assert_eq!(lms_inverse(&lms_forward(&s, step), step), s, "step {step}");
+        }
+        let z = vec![0i64; 256];
+        assert_eq!(lms_inverse(&lms_forward(&z, 8), 8), z);
     }
 }

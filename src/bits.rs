@@ -163,11 +163,17 @@ impl<'a> BitReader<'a> {
 pub enum PartParam {
     Rice(u8),   // k
     Escape(u8), // raw width in bits, 0 = all zeros
+    /// Quotient coded with an rANS adaptive-binary model; the k low bits
+    /// of each zigzag value still go in raw.
+    Rans(u8),
 }
 
 pub struct ResidualPlan {
     pub p: u8,
     pub params: Vec<PartParam>,
+    /// Cell blobs for `params[i] == Rans` (parallel index); an empty slot
+    /// means `write_residual` encodes that partition itself.
+    pub rans_blobs: Vec<Vec<u16>>,
     pub cost: u64, // exact bits the encoder will emit
 }
 
@@ -175,14 +181,46 @@ fn rice_cost(sum_q: u64, n_p: u64, k: u64) -> u64 {
     // payload: unary (u>>k zeros + stop) + k low bits per sample
     sum_q
         .saturating_add(n_p.saturating_mul(k + 1))
-        .saturating_add(5)
+        .saturating_add(6)
 }
 
 fn escape_cost(n_p: u64, width: u64) -> u64 {
     if width > 63 {
         return u64::MAX / 4; // width field only holds 0..=63
     }
-    n_p.saturating_mul(width).saturating_add(11) // 5 param + 6 width
+    n_p.saturating_mul(width).saturating_add(12) // 6 param + 6 width
+}
+
+/// rANS partition encoding: quotient bits as adaptive-unary (context per
+/// run position, capped at 63), remainders raw. Returns the u16 cell blob
+/// (payload); callers add 6 param + 16 length + k·n bits overhead.
+fn rans_encode_part(s: &[i64], k: u8) -> Option<Vec<u16>> {
+    use crate::rc::{ProbBin, RcEnc};
+    let mut ctxs = Vec::new();
+    ctxs.resize(64, ProbBin::new());
+    let mut bits: Vec<u8> = Vec::new();
+    let mut probs: Vec<u16> = Vec::new();
+    for &v in s {
+        let q = zigzag(v) >> k;
+        if q > 1 << 26 {
+            return None; // pathological quotient — escape territory
+        }
+        for j in 0..q {
+            let ci = (j as usize).min(63);
+            probs.push(ctxs[ci].get() as u16);
+            bits.push(0);
+            ctxs[ci].adapt(0);
+        }
+        let ci = (q as usize).min(63);
+        probs.push(ctxs[ci].get() as u16);
+        bits.push(1);
+        ctxs[ci].adapt(1);
+    }
+    let mut enc = RcEnc::new();
+    for i in (0..bits.len()).rev() {
+        enc.put_prob(u32::from(probs[i]), bits[i]);
+    }
+    Some(enc.finish())
 }
 
 /// Plan a partitioned Rice encoding of `e` (raw signed residuals).
@@ -193,26 +231,18 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
         return ResidualPlan {
             p: 0,
             params: Vec::new(),
+            rans_blobs: Vec::new(),
             cost: 0,
         };
     }
-    let u: Vec<u64> = e.iter().map(|&v| zigzag(v)).collect();
-    let mean = u.iter().fold(0u128, |a, &v| a + v as u128) / n as u128;
+    let mean = e.iter().fold(0u128, |a, &v| a + u128::from(zigzag(v))) / n as u128;
     let mean1 = (mean + 1).min(u64::MAX as u128) as u64;
+    // per-partition k never strayed past +-4 of the global center on the
+    // 47-file corpus (measured 0 size delta) — keep the narrow window
     let center = bit_len(mean1).saturating_sub(1);
     let k_lo = center.saturating_sub(4);
     let k_hi = (center + 4).min(30);
     let ks: Vec<u64> = (u64::from(k_lo)..=u64::from(k_hi)).collect();
-
-    // prefix sums of u>>k for every k in the window, one flat allocation
-    let mut ps = vec![0u64; ks.len() * (n + 1)];
-    for (ki, &k) in ks.iter().enumerate() {
-        let acc = &mut ps[ki * (n + 1)..(ki + 1) * (n + 1)];
-        for i in 0..n {
-            acc[i + 1] = acc[i].saturating_add(u[i] >> k);
-        }
-    }
-    let ps_row = |ki: usize| &ps[ki * (n + 1)..(ki + 1) * (n + 1)];
 
     // valid partition orders need n % 2^p == 0; finest = min(8, v2(n))
     let pf = (n.trailing_zeros() as u8).min(MAX_PART_ORDER);
@@ -221,14 +251,32 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
     let fp_len = n >> pf;
     let mut fine_max = vec![0u64; nf];
     for (j, m) in fine_max.iter_mut().enumerate() {
-        *m = u[j * fp_len..(j + 1) * fp_len]
+        *m = e[j * fp_len..(j + 1) * fp_len]
             .iter()
-            .fold(0, |a, &v| a.max(v));
+            .fold(0, |a, &v| a.max(zigzag(v)));
     }
+
+    // Prefix sums of u>>k at chunk granularity only: every partition is a
+    // run of whole fp_len chunks, so sum(s..t) = cs[t/fp_len]-cs[s/fp_len].
+    let mut cs = vec![0u64; ks.len() * (nf + 1)];
+    for (ki, &k) in ks.iter().enumerate() {
+        let row = &mut cs[ki * (nf + 1)..(ki + 1) * (nf + 1)];
+        let mut acc = 0u64;
+        let mut c = 1usize;
+        for (i, &v) in e.iter().enumerate() {
+            acc = acc.saturating_add(zigzag(v) >> k);
+            if (i + 1) % fp_len == 0 {
+                row[c] = acc;
+                c += 1;
+            }
+        }
+    }
+    let ps_row = |ki: usize| &cs[ki * (nf + 1)..(ki + 1) * (nf + 1)];
 
     let mut best = ResidualPlan {
         p: 0,
         params: Vec::new(),
+        rans_blobs: Vec::new(),
         cost: u64::MAX,
     };
     for p in 0..=pf {
@@ -246,7 +294,7 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
             let mut part = (escape_cost(n_p, width), PartParam::Escape(width as u8));
             for (ki, &k) in ks.iter().enumerate() {
                 let row = ps_row(ki);
-                let sum_q = row[t].saturating_sub(row[s]);
+                let sum_q = row[t / fp_len].saturating_sub(row[s / fp_len]);
                 let c = rice_cost(sum_q, n_p, k);
                 if c < part.0 {
                     part = (c, PartParam::Rice(k as u8));
@@ -259,8 +307,65 @@ pub fn plan_residual(e: &[i64]) -> ResidualPlan {
             best = ResidualPlan {
                 p,
                 params,
+                rans_blobs: vec![Vec::new(); parts],
                 cost: total,
             };
+        }
+    }
+
+    // rANS pass on the winning level only: adaptive-unary quotient coding.
+    // A strided probe decides, then one exact encode fixes the real cost.
+    // rANS cells ride in a u16-length field, so blobs over 65535 cells are
+    // not representable — those partitions keep Rice.
+    let n_p = (n >> best.p) as u64;
+    if best.cost != u64::MAX && n_p >= 64 {
+        let n_pu = n_p as usize;
+        for j in 0..best.params.len() {
+            let PartParam::Rice(k0) = best.params[j] else {
+                continue;
+            };
+            let (s, t) = (j * n_pu, (j + 1) * n_pu);
+            let probe: Vec<i64> = e[s..t].iter().step_by(2).copied().collect();
+            // rANS optimal k can differ from the Rice pick — probe ±1
+            let mut k_best = (k0, u64::MAX);
+            for kc in [k0, k0.saturating_sub(1), (k0 + 1).min(30)] {
+                let Some(pb) = rans_encode_part(&probe, kc) else {
+                    continue;
+                };
+                let est = 6u64
+                    .saturating_add(16)
+                    .saturating_add(16 * pb.len() as u64 * n_p / probe.len() as u64)
+                    .saturating_add(u64::from(kc) * n_p);
+                if est < k_best.1 {
+                    k_best = (kc, est);
+                }
+            }
+            let (k_sel, est) = k_best;
+            if est == u64::MAX {
+                continue;
+            }
+            let ki = (u64::from(k0) - u64::from(k_lo)) as usize;
+            let row = ps_row(ki);
+            let sum_q = row[t / fp_len].saturating_sub(row[s / fp_len]);
+            let old = rice_cost(sum_q, n_p, u64::from(k0));
+            if est >= old {
+                continue;
+            }
+            let Some(blob) = rans_encode_part(&e[s..t], k_sel) else {
+                continue;
+            };
+            if blob.len() > u16::MAX as usize {
+                continue;
+            }
+            let exact = 6u64
+                .saturating_add(16)
+                .saturating_add(16 * blob.len() as u64)
+                .saturating_add(u64::from(k_sel) * n_p);
+            if exact < old {
+                best.params[j] = PartParam::Rans(k_sel);
+                best.rans_blobs[j] = blob;
+                best.cost = best.cost.saturating_sub(old).saturating_add(exact);
+            }
         }
     }
     best
@@ -278,7 +383,7 @@ pub fn write_residual(w: &mut BitWriter, e: &[i64], plan: &ResidualPlan) {
         let s = &e[j * n_p..(j + 1) * n_p];
         match param {
             PartParam::Rice(k) => {
-                w.write(u64::from(k), 5);
+                w.write(u64::from(k), 6);
                 for &v in s {
                     let u = zigzag(v);
                     w.write_unary(u >> k);
@@ -286,10 +391,29 @@ pub fn write_residual(w: &mut BitWriter, e: &[i64], plan: &ResidualPlan) {
                 }
             }
             PartParam::Escape(width) => {
-                w.write(31, 5);
+                w.write(62, 6);
                 w.write(u64::from(width), 6);
                 for &v in s {
                     w.write(zigzag(v) & mask(u32::from(width)), u32::from(width));
+                }
+            }
+            PartParam::Rans(k) => {
+                // [param u6][blob_len u16][cells][n_p remainders of k bits]
+                let owned;
+                let blob: &[u16] = match plan.rans_blobs.get(j) {
+                    Some(b) if !b.is_empty() => b,
+                    _ => {
+                        owned = rans_encode_part(s, k).expect("planned rANS encodes");
+                        &owned
+                    }
+                };
+                w.write(31 + u64::from(k), 6);
+                w.write(blob.len() as u64, 16);
+                for &c in blob {
+                    w.write(u64::from(c), 16);
+                }
+                for &v in s {
+                    w.write(zigzag(v) & mask(u32::from(k)), u32::from(k));
                 }
             }
         }
@@ -313,22 +437,57 @@ pub fn read_residual(r: &mut BitReader<'_>, n: usize) -> Result<Vec<i64>, String
     let mut out = vec![0i64; n];
     for j in 0..parts {
         let s = &mut out[j * n_p..(j + 1) * n_p];
-        let param = r.read(5);
-        if param == 31 {
-            let width = r.read(6) as u32;
-            if width > 63 {
-                return Err("escape width out of range".into());
+        let param = r.read(6);
+        match param {
+            0..=30 => {
+                let k = param as u32;
+                for v in s.iter_mut() {
+                    let q = r.read_unary()?;
+                    let u = (u64::from(q) << k) | r.read(k);
+                    *v = unzigzag(u);
+                }
             }
-            for v in s.iter_mut() {
-                *v = unzigzag(r.read(width));
+            62 => {
+                let width = r.read(6) as u32;
+                if width > 63 {
+                    return Err("escape width out of range".into());
+                }
+                for v in s.iter_mut() {
+                    *v = unzigzag(r.read(width));
+                }
             }
-        } else {
-            let k = param as u32;
-            for v in s.iter_mut() {
-                let q = r.read_unary()?;
-                let u = (u64::from(q) << k) | r.read(k);
-                *v = unzigzag(u);
+            31..=61 => {
+                let k = (param - 31) as u32;
+                let ncells = r.read(16) as usize;
+                let mut cells = Vec::with_capacity(ncells);
+                for _ in 0..ncells {
+                    cells.push(r.read(16) as u16);
+                }
+                if r.overrun {
+                    return Err("truncated payload".into());
+                }
+                let mut ctxs = Vec::new();
+                ctxs.resize(64, crate::rc::ProbBin::new());
+                let mut dec = crate::rc::RcDec::new(&cells)?;
+                for v in s.iter_mut() {
+                    // unary quotient: 0-bits until the stop bit, context per
+                    // run position capped at 63
+                    let mut q: u64 = 0;
+                    loop {
+                        let bit = dec.get(&mut ctxs[(q as usize).min(63)]);
+                        if bit == 1 {
+                            break;
+                        }
+                        q += 1;
+                        // encoder-side cap in rans_encode_part is 1<<26
+                        if q > 1 << 26 {
+                            return Err("unary run too long".into());
+                        }
+                    }
+                    *v = unzigzag(q << k | r.read(k));
+                }
             }
+            _ => return Err("partition param out of range".into()),
         }
     }
     if r.overrun {

@@ -63,10 +63,10 @@ print("wrote docs/assets/banner.png")
 # ----------------------------------------- chart 1: size by input format
 # .flq size as % of source, single-file encode (lower = better).
 fmt = [
-    ("FLAC -> PCM", 98.4),
-    ("AIFF f32", 77.9),
-    ("WAV int", 54.6),
-    ("WAV float", 53.2),
+    ("FLAC -> PCM", 98.2),
+    ("AIFF f32", 77.5),
+    ("WAV int", 50.5),
+    ("WAV float", 36.9),
 ]
 fig, ax = plt.subplots(figsize=(7.2, 2.9))
 bars = ax.barh([n for n, _ in fmt], [v for _, v in fmt], color=BLUE, height=0.62)
@@ -95,8 +95,8 @@ ref = [
     ("7-Zip LZMA2 -mx9", 64.60, MUT),
     ("WavPack -hx", 52.04, BLUE),
     ("FLAC -8", 51.15, BLUE),
-    ("FLQ encode", 50.87, ORANGE),
     ("Monkey's Audio -c4000", 50.85, BLUE),
+    ("FLQ encode", 50.27, ORANGE),
     ("TAK -p4m", 49.88, BLUE),
     ("OptimFROG extranew-light", 48.40, BLUE),
 ]
@@ -119,3 +119,34 @@ fig.tight_layout()
 fig.savefig(os.path.join(OUT, "vs-reference-codecs.svg"), transparent=True)
 plt.close(fig)
 print("wrote docs/assets/vs-reference-codecs.svg")
+
+# ------------------ chart 3: memory vs audio length (flq only) ------------
+# Internal measurement on the author's machine (i7-14650HX, 24 threads):
+# generated i16 stereo 48 kHz WAVs of 0.5/2/5/10 min (≈5.5/22/55/110 MiB).
+# Peak working set polled via GetProcessMemoryInfo on the child process.
+# Data: testdata/results/2026-10-22_memspeed.md (D:\TEMP\flq_ab\memtime.py).
+mins = [0.5, 2, 5, 10]
+mem_enc = [36.4, 38.8, 39.2, 39.8]
+mem_dec = [22.6, 27.3, 27.3, 27.8]
+
+fig, axs = plt.subplots(1, 2, figsize=(7.2, 2.6), sharex=True)
+for ax, vals, title, top in zip(axs, (mem_enc, mem_dec), ("encode", "decode"), (45, 32)):
+    ax.plot(mins, vals, marker="o", ms=3, lw=1.4, color=ORANGE)
+    ax.set_ylim(0, top)
+    ax.set_title(title, fontsize=10, color=FG, pad=6)
+    ax.tick_params(labelsize=9, colors=MUT, length=0)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color(MUT)
+    ax.grid(axis="y", color=MUT, alpha=0.18, lw=0.6)
+axs[0].set_ylabel("peak process memory, MiB", fontsize=9, color=MUT)
+fig.text(0.5, 0.015, "audio length, min (i16 stereo 48 kHz ≈ 11 MiB/min) — measured on one machine, i7-14650HX",
+         ha="center", fontsize=9, color=MUT)
+fig.patch.set_alpha(0)
+for ax in axs:
+    ax.set_facecolor("none")
+fig.tight_layout(rect=[0, 0.08, 1, 1])
+fig.savefig(os.path.join(OUT, "memory-vs-length.svg"), transparent=True)
+plt.close(fig)
+print("wrote docs/assets/memory-vs-length.svg")

@@ -17,14 +17,15 @@ specified in [`docs/SPEC-v1.md`](docs/SPEC-v1.md) with conformance vectors
 in [`testdata/v1/`](testdata/v1/).
 
 **Benchmark headline.** On a common 47-file subset accepted by every
-compared tool, `flq encode` produced 50.9% of the source size, compared
-with 51.2% for FLAC -8 and 52.0% for WavPack -hx — smaller files than
-FLAC on 43/47 inputs and than WavPack on 31/47. Monkey's Audio (50.85%,
-smaller than FLQ on 29/47), TAK and OptimFROG compress further.
+compared tool, `flq encode` produced 50.3% of the source size, compared
+with 51.1% for FLAC -8 and 52.0% for WavPack -hx — smaller files than
+FLAC on 46/47 inputs and than WavPack on 35/47, and ahead of Monkey's
+Audio (50.85%) on aggregate.
 
-These results compare compression ratio, not overall performance: at
-equal thread count FLQ's LPC/Rice path encodes ~8–9× slower than FLAC -8
-(8.8 vs 67.6 MiB/s on 1 thread, 30.8 vs 285.7 MiB/s on 8).
+The deeper analysis chain (high-order LPC, LTP, LMS, rANS) spends CPU
+on encode — ~100× realtime on 24 threads (~10× single-threaded) for a
+10-minute WAV. Decode is light: ~290× realtime at one thread, faster
+still with parallel frames.
 
 [Full comparison and methodology](#vs-reference-codecs).
 
@@ -47,9 +48,75 @@ stem, seek, WAV export) — see [`web/README.md`](web/README.md).
 Options. `encode`: `-0`/`-5`/`-8` (LPC search depth; default `-5`, within
 0.01 pp of exhaustive `-8`), `-j N` (threads; default all cores),
 `--frame N` (frame length, multiple of 4096), `--no-index`. `decode`:
-`--only name…`, `--range a:b` (seconds), `--format wav|flac`
+`-j N` (threads; default all cores), `--only name…`, `--range a:b`
+(seconds), `--format wav|flac`
 (default: the source's family). `bench` measures encode+decode in memory.
 Every command refuses to overwrite existing files.
+
+## Measured results
+
+Dated reports: [`testdata/results/`](testdata/results/). Corpus: a
+Freesound-derived sample pack (not redistributed).
+
+### 148 WAV/AIFF files, 1572 MiB
+
+| | Result |
+|---|---|
+| Accepted / verified | 148/148 — decoded WAV data chunks byte-identical (AIFF: pcm_crc) |
+| Output | 54.74% of source (median 57.3%) |
+| Encode / decode | 19.6 MiB/s on 24 threads (process-level, incl. small files) / 12.3 s total, parallel frames |
+| Peak heap | encode ≤ 53 MiB; decode 0.6 MiB at `-j1`, ≤ 27 MiB at `-j24` (48 frames in flight) |
+| Seek | 0.1 s anywhere in a 600 s file: 6–20 ms wall, process start included |
+
+Frame-reset cost on the 47-file set vs the largest frame (262144
+samples): +0.44 pp at 4096-sample frames, +0.22 pp at 8192, **+0.10 pp
+at 16384 (default)**, +0.05 pp at 32768, +0.02 pp at 65536. Details:
+[`2026-10-22_recheck.md`](testdata/results/2026-10-22_recheck.md).
+
+Single-file encodes by input format — FLAC sources stay near input
+size (already-compressed payload), PCM lands at ~37–78% depending on
+content; per-file numbers live in [`testdata/results/`](testdata/results/):
+
+![FLQ size as % of source by format — single-file encode](docs/assets/compression-by-format.svg)
+
+### vs reference codecs
+
+Same corpus, same files, single-file encode, verified decode — the
+47-file subset every tool accepted (identical inputs):
+
+![FLQ vs reference codecs — output size on identical inputs](docs/assets/vs-reference-codecs.svg)
+
+FLQ lands at 50.27% — ahead of FLAC, WavPack and Monkey's Audio on
+aggregate. Aggregate hides the per-file picture, so here are the
+pairwise counts — a "win" means FLQ's file is smaller on that input:
+
+| FLQ vs | wins / losses | median delta |
+|---|---|---|
+| FLAC | 46 / 1 | +1.08 pp |
+| WavPack | 35 / 12 | +1.26 pp |
+| Monkey's Audio | 25 / 22 | +0.05 pp |
+| TAK | 9 / 38 | −0.50 pp |
+| OptimFROG | 1 / 46 | −1.69 pp |
+| 7-Zip | 40 / 7 | +12.19 pp |
+| Zstd | 43 / 4 | +26.54 pp |
+
+Delta = reference codec size (% of source) − FLQ size (% of source).
+Positive values mean FLQ produced smaller files.
+
+FLQ's lead over FLAC and WavPack is consistent across files; Monkey's
+Audio is a per-file coin flip with FLQ ahead on aggregate.
+
+### Memory
+
+Peak process memory vs input length — generated i16 stereo 48 kHz
+inputs, internal measurement on this machine:
+
+![Peak process memory vs audio length](docs/assets/memory-vs-length.svg)
+
+Flat in input length — the codec streams: ~40 MiB encode, ~28 MiB
+decode at 24 threads (parallel frame workers); at `-j1` decode peaks at
+0.6 MiB counted heap. Per-file numbers:
+[`2026-10-22_memspeed.md`](testdata/results/2026-10-22_memspeed.md)
 
 ## What each format becomes
 
@@ -59,10 +126,10 @@ headers; a FLAC comes back re-encoded with its tag blocks preserved).
 
 | Input | Stored as | `decode` gives (default) | Guarantee |
 |---|---|---|---|
-| WAV (int 8/16/24/32, float 32/64, extensible) | framed LPC/Rice | WAV | sample-exact |
-| AIFF / AIFF-C | framed LPC/Rice | WAV | sample-exact |
-| FLAC | framed LPC/Rice + tag blocks | FLAC (or WAV) | sample-exact + tags |
-| ALAC (`.m4a`) | framed LPC/Rice + tags | FLAC (or WAV) | sample-exact + tags |
+| WAV (int 8/16/24/32, float 32/64, extensible) | framed LPC+LTP/rANS | WAV | sample-exact |
+| AIFF / AIFF-C | framed LPC+LTP/rANS | WAV | sample-exact |
+| FLAC | framed LPC+LTP/rANS + tag blocks | FLAC (or WAV) | sample-exact + tags |
+| ALAC (`.m4a`) | framed LPC+LTP/rANS + tags | FLAC (or WAV) | sample-exact + tags |
 | MP3, AAC, Ogg | rejected — flq is lossless | | |
 
 ## How it works
@@ -75,110 +142,27 @@ index         per track: frame offsets (u64) + crc32          (optional; frames 
 ```
 
 A frame payload is the codec applied to `frame_len` samples (default
-16384): 4096-sample blocks, per block a stereo mode (L/R, L/S, R/S, M/S),
-per signal LPC up to order 32 with 15-bit coefficients and a partitioned
-Rice residual; float tracks split into an integer significand stream plus
-exact tail bits. History resets at every frame start; the first `order`
-samples are stored verbatim, which keeps the frame cost at +0.10 pp over
-continuous coding. Seeking reads the index, decodes one frame and trims.
+16384): 4096-sample blocks, per block a stereo mode (L/R, L/S, R/S, M/S,
+plus two adaptive-gain modes on a 1/128 grid), per signal LPC up to order
+63 with 15-bit coefficients, then optional long-term pitch prediction
+(lag ≤ 4095) and an adaptive two-tap sign-sign pass on the residual, and
+finally partitioned coding where each partition picks Rice, escape, or an
+adaptive rANS quotient coder; float tracks split into an integer
+significand stream plus exact tail bits. History resets at every frame
+start; the first `order` samples are stored verbatim, which keeps the
+frame cost at +0.10 pp over continuous coding. Seeking reads the index, decodes one frame and trims.
 Decoding streams frame by frame (0.6 MiB heap for a 77 MB WAV); encoding
 streams WAV/AIFF input and codes frames in parallel. There are no
 cross-track references anywhere in the codec or the wire format.
-
-## Measured results
-
-Dated reports: [`testdata/results/`](testdata/results/). Corpus: a
-Freesound-derived sample pack (not redistributed).
-
-### 148 WAV/AIFF files, 1572 MiB
-
-| | Result |
-|---|---|
-| Accepted / verified | 148/148 — decoded WAV data chunks byte-identical (AIFF: pcm_crc) |
-| Output | 55.75% of source (median 58.0%) |
-| Encode / decode | 51.6 MiB/s on 24 threads (process-level, incl. small files) / single-threaded streaming |
-| Peak heap | encode ≤ 53 MiB, decode ≤ 0.8 MiB (77 MB WAV: 28 MiB / 0.6 MiB) |
-| Seek | 0.1 s anywhere in a 400 s file: 9–23 ms wall, process start included |
-
-Frame-reset cost on the 47-file set vs continuous coding: +0.41 pp at
-4096-sample frames, +0.20 pp at 8192, **+0.10 pp at 16384 (default)**,
-+0.05 pp at 32768. Details:
-[`2026-10-22_9f25157.md`](testdata/results/2026-10-22_9f25157.md).
-
-Earlier single-file measurements by input format (WAV int 54.6%,
-WAV float 53.2%, AIFF f32 77.9%, FLAC → PCM ~98% of source) live in
-[`testdata/results/`](testdata/results/):
-
-![FLQ size as % of source by format — single-file encode](docs/assets/compression-by-format.svg)
-
-### vs reference codecs
-
-Same corpus, same files, single-file encode, verified decode. On the
-47-file subset every tool accepted (identical inputs):
-
-| Codec | Output, % of source |
-|---|---|
-| OptimFROG extranew-light | 48.4% |
-| TAK -p4m | 49.9% |
-| Monkey's Audio -c4000 | 50.85% |
-| **FLQ `encode` (default)** | **50.87%** |
-| FLAC -8 | 51.2% |
-| WavPack -hx | 52.0% |
-| 7-Zip LZMA2 -mx9 | 64.6% |
-| Zstd --ultra -22 | 78.1% |
-
-![FLQ vs reference codecs — output size on identical inputs](docs/assets/vs-reference-codecs.svg)
-
-Aggregate percentages hide the per-file picture, so here are the
-pairwise counts — a "win" means FLQ's file is smaller on that input:
-
-| FLQ vs | wins / losses | median delta |
-|---|---|---|
-| FLAC | 43 / 4 | +0.30 pp |
-| WavPack | 31 / 16 | +0.98 pp |
-| Monkey's Audio | 18 / 29 | −0.42 pp |
-| TAK | 3 / 44 | −0.90 pp |
-| OptimFROG | 1 / 46 | −1.99 pp |
-| 7-Zip | 40 / 7 | +12.13 pp |
-| Zstd | 43 / 4 | +25.65 pp |
-
-Delta = reference codec size (% of source) − FLQ size (% of source).
-Positive values mean FLQ produced smaller files.
-
-FLQ's lead over FLAC and WavPack is consistent across files; Monkey's
-Audio is slightly ahead of it; OptimFROG and TAK stay ahead of all three.
-
-#### ablation: which stage earns it
-
-Payload bytes, same 47 files:
-
-| Pipeline stage | % of source | per-file vs FLAC |
-|---|---|---|
-| per-channel LPC/Rice | 50.95% | 32 win / 15 loss |
-| + stereo decorrelation | 50.77% | — |
-| + independent 16384-sample frames | 50.87% | 43 win / 4 loss |
-
-So the LPC/Rice core alone is already at/below FLAC's file-level size;
-stereo modes add ~0.2 pp, and independent frames give back 0.10 pp. This
-is a codec comparison, not a container trick.
-
-Its edge is coverage: FLAC rejected 69/148 corpus files (float WAV,
-AIFF, odd headers), OptimFROG 69, TAK 94, while FLQ, WavPack and APE took
-all 148. The honest cost is encode speed: at equal threads the LPC/Rice
-path is ~8–9× slower than FLAC -8; decode stays fast (~0.2 s/file).
-Speed measurements and presets:
-[`2026-10-22_9f25157.md`](testdata/results/2026-10-22_9f25157.md). PAQ8PX is the
-theoretical extreme, not a practical one (~61% at ~2,000× FLAC's encode
-time). Full method, settings, per-format tables and the ablation:
-[`2026-10-22_e254a5b.md`](testdata/results/2026-10-22_e254a5b.md)
 
 ## Modules
 
 | Path | Role |
 |---|---|
 | `src/v1/` | the format: header/meta/frame/index (`mod.rs`), streaming encoder (`enc.rs`), `Reader` with seek, range decode, resync (`dec.rs`) |
-| `src/codec.rs` | float split, stereo modes, LPC (presets, warm-up), block plan/write/read |
-| `src/bits.rs` | MSB-first bit IO, partitioned Rice + escape, CRC32 |
+| `src/codec.rs` | float split, stereo modes incl. adaptive gain, LPC (presets, warm-up), LTP, LMS pass, block plan/write/read |
+| `src/bits.rs` | MSB-first bit IO, partitioned Rice + escape + rANS partitions, CRC32 |
+| `src/rc.rs` | adaptive-binary rANS core (u16-cell Giesen-style renormalization) |
 | `src/formats.rs` | sniffing, FLAC/ALAC decode, tag blobs, FLAC/WAV output |
 | `src/wav.rs` · `src/aiff.rs` | container parsing (whole-file and header-only) and write-back |
 | `src/main.rs` | CLI + timing/heap metrics |
@@ -203,8 +187,10 @@ bytes not); ALAC comes out as FLAC; SEEKTABLE/PADDING not preserved.
 **Structure.** 255 tracks max per `.flq`. Frames are independent — a
 corrupt frame costs at most that frame, and only on its own track.
 
-**Speed.** Encoding is roughly an order of magnitude slower than FLAC at
-equal thread count; decoding is single-threaded.
+**Speed.** Encoding spends real CPU on its analysis chain (~100×
+realtime at 24 threads, ~10× single-threaded); decoding parallelizes
+across frames (`-j`, default all cores) and stays a streaming O(frame)
+reader.
 
 **Status.** Experimental tool. The v1.0 bitstream is frozen by the spec
 and conformance vectors. Results from one corpus — not yet checked on a
