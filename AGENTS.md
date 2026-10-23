@@ -121,8 +121,12 @@ Reference results (47-file common set,
 (+0.10 pp vs 262144-sample frames), smaller than FLAC -8 on 46/47 and than
 APE -c4000 on aggregate; TAK and OptimFROG still ahead. Older LPC32/Rice
 pipeline run: `2026-10-22_9f25157.md` (50.87%); the same numbers re-run
-on the final pipeline: `2026-10-22_recheck.md` — 148 WAV/AIFF: 54.74%,
-encode ≤ 53 MiB heap, decode 0.6 MiB at -j1 / ≤ 27 MiB at -j24.
+on the final pipeline: `2026-10-22_recheck.md` — 148 WAV/AIFF: 54.74%;
+encode ≤ 53 MiB heap, decode 0.6 MiB at -j1 / ≤ 27 MiB at -j24. Full
+256-file corpus after the encode-speed pass:
+`2026-10-23_sweep256.md` — 172 accepted lossless inputs, 58.7% of
+source, enc 30.5 s / dec 13.1 s total; speed/memory detail:
+`2026-10-23_encspeed.md`.
 
 ## Known limits
 

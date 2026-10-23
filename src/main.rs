@@ -1,4 +1,4 @@
-use flq::{aiff, formats, v1, wav};
+use flq::{aiff, codec, formats, v1, wav};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
@@ -332,6 +332,7 @@ fn cmd_encode(ins: &[String], out: &str, opts: &v1::enc::V1Opts) -> Result<(), S
         },
     );
     let (stats, metas) = r?;
+    codec::prof::dump();
     print_stats(&stats, &metas);
     println!(
         "preset -{}, {} threads, frame {}",

@@ -61,12 +61,13 @@ plt.close(fig)
 print("wrote docs/assets/banner.png")
 
 # ----------------------------------------- chart 1: size by input format
-# .flq size as % of source, single-file encode (lower = better).
+# .flq size as % of source, aggregate over the corpus's accepted files
+# (lower = better). Data: testdata/results/2026-10-23_sweep256.md.
 fmt = [
-    ("FLAC -> PCM", 98.2),
-    ("AIFF f32", 77.5),
-    ("WAV int", 50.5),
-    ("WAV float", 36.9),
+    ("FLAC input (24)", 97.8),
+    ("AIFF (6)", 77.7),
+    ("WAV int (79)", 54.0),
+    ("WAV float (63)", 50.5),
 ]
 fig, ax = plt.subplots(figsize=(7.2, 2.9))
 bars = ax.barh([n for n, _ in fmt], [v for _, v in fmt], color=BLUE, height=0.62)
@@ -74,7 +75,7 @@ for b, v in zip(bars, [v for _, v in fmt]):
     ax.text(v + 1.5, b.get_y() + b.get_height() / 2, f"{v:.1f}%",
             va="center", fontsize=9, color=MUT)
 ax.set_xlim(0, 118)
-ax.set_xlabel(".flq size, % of source — lower is better", fontsize=9, color=MUT)
+ax.set_xlabel(".flq size, % of source — aggregate per kind, lower is better", fontsize=9, color=MUT)
 ax.tick_params(labelsize=9, colors=MUT, length=0)
 for s in ("top", "right"):
     ax.spines[s].set_visible(False)
@@ -120,33 +121,42 @@ fig.savefig(os.path.join(OUT, "vs-reference-codecs.svg"), transparent=True)
 plt.close(fig)
 print("wrote docs/assets/vs-reference-codecs.svg")
 
-# ------------------ chart 3: memory vs audio length (flq only) ------------
-# Internal measurement on the author's machine (i7-14650HX, 24 threads):
-# generated i16 stereo 48 kHz WAVs of 0.5/2/5/10 min (≈5.5/22/55/110 MiB).
-# Peak working set polled via GetProcessMemoryInfo on the child process.
-# Data: testdata/results/2026-10-22_memspeed.md (D:\TEMP\flq_ab\memtime.py).
-mins = [0.5, 2, 5, 10]
-mem_enc = [36.4, 38.8, 39.2, 39.8]
-mem_dec = [22.6, 27.3, 27.3, 27.8]
-
-fig, axs = plt.subplots(1, 2, figsize=(7.2, 2.6), sharex=True)
-for ax, vals, title, top in zip(axs, (mem_enc, mem_dec), ("encode", "decode"), (45, 32)):
-    ax.plot(mins, vals, marker="o", ms=3, lw=1.4, color=ORANGE)
-    ax.set_ylim(0, top)
-    ax.set_title(title, fontsize=10, color=FG, pad=6)
-    ax.tick_params(labelsize=9, colors=MUT, length=0)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    for s in ("left", "bottom"):
-        ax.spines[s].set_color(MUT)
-    ax.grid(axis="y", color=MUT, alpha=0.18, lw=0.6)
-axs[0].set_ylabel("peak process memory, MiB", fontsize=9, color=MUT)
-fig.text(0.5, 0.015, "audio length, min (i16 stereo 48 kHz ≈ 11 MiB/min) — measured on one machine, i7-14650HX",
-         ha="center", fontsize=9, color=MUT)
-fig.patch.set_alpha(0)
-for ax in axs:
-    ax.set_facecolor("none")
-fig.tight_layout(rect=[0, 0.08, 1, 1])
-fig.savefig(os.path.join(OUT, "memory-vs-length.svg"), transparent=True)
+# ----------------- chart 3: wall time, same file for every tool ----------
+# 73.6 MiB i16 stereo 48 kHz WAV (~6.7 min audio), single encode+decode,
+# peak working set polled. flq -j24 (all cores) vs references at their
+# bench settings — incl. flac -j8 (its own multithreading).
+# Data: testdata/results/2026-10-23_encspeed.md (D:\TEMP\flq_ab\mem_bench.py).
+spd = [
+    # (name, enc s, dec s, color)
+    ("OptimFROG xnewl",      12.08, 8.98, BLUE),
+    ("TAK -p4m",              2.06, 0.63, BLUE),
+    ("FLQ encode",            1.67, 0.62, ORANGE),
+    ("WavPack -hx",           1.37, 0.37, BLUE),
+    ("Monkey's Audio -c4000", 0.60, 0.72, BLUE),
+    ("FLAC -8 -j8",           0.22, 0.40, BLUE),
+]
+fig, ax = plt.subplots(figsize=(7.2, 3.2))
+y = np.arange(len(spd))
+bh = 0.36
+b1 = ax.barh(y + bh / 2, [e for _, e, _, _ in spd], height=bh, color=[c for _, _, _, c in spd])
+b2 = ax.barh(y - bh / 2, [d for _, _, d, _ in spd], height=bh, color=[c for _, _, _, c in spd], alpha=0.45)
+for b, v in zip(b1, [e for _, e, _, _ in spd]):
+    ax.text(v * 1.04, b.get_y() + b.get_height() / 2, f"{v:.2f}s", va="center", fontsize=8, color=MUT)
+for b, v in zip(b2, [d for _, _, d, _ in spd]):
+    ax.text(v * 1.04, b.get_y() + b.get_height() / 2, f"{v:.2f}s", va="center", fontsize=8, color=MUT)
+ax.set_yticks(y, [n for n, _, _, _ in spd])
+ax.invert_yaxis()
+ax.set_xscale("log")
+ax.set_xlim(0.2, 25)
+ax.set_xlabel("wall seconds — upper solid bar encode, lower faint bar decode (log scale)",
+              fontsize=9, color=MUT)
+ax.tick_params(labelsize=9, colors=MUT, length=0)
+for s in ("top", "right"):
+    ax.spines[s].set_visible(False)
+for s in ("left", "bottom"):
+    ax.spines[s].set_color(MUT)
+fig.patch.set_alpha(0); ax.set_facecolor("none")
+fig.tight_layout()
+fig.savefig(os.path.join(OUT, "speed-vs-codecs.svg"), transparent=True)
 plt.close(fig)
-print("wrote docs/assets/memory-vs-length.svg")
+print("wrote docs/assets/speed-vs-codecs.svg")

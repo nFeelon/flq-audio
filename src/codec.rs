@@ -1,13 +1,115 @@
 //! Per-track block coding: float split, stereo decorrelation, LPC + Rice.
 
 use crate::bits::{
-    BitReader, BitWriter, ResidualPlan, bit_len, plan_residual, read_residual, write_residual,
+    BitReader, BitWriter, ResidualPlan, bit_len, plan_residual, plan_residual_cap, read_residual,
+    write_residual,
 };
 
 pub const BLOCK: usize = 4096;
 pub const MAX_ORDER: usize = 63;
 pub const ORDERS: [usize; 11] = [0, 1, 2, 4, 8, 12, 16, 24, 32, 48, 63];
 pub const LPC_PREC: u32 = 15;
+
+/// Dev-only stage timers: set FLQ_PROF to get a per-stage nanos dump on
+/// stderr after encode/bench. Zero-cost otherwise (one atomic load per
+/// instrumented call).
+#[doc(hidden)]
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub const NAMES: [&str; 16] = [
+        "autocorr",
+        "levinson",
+        "proxy",
+        "eval_order",
+        "plan_residual",
+        "rans_encode",
+        "ltp_coarse",
+        "ltp_exact",
+        "lms",
+        "stereo_prep",
+        "write_track",
+        "predict_map",
+        "rans_p1",
+        "rans_p2",
+        "plan_scan",
+        "plan_eval",
+    ];
+    pub static NS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
+    /// calls, capped-aborts, total bit-events; +plan_residual calls,
+    /// eval_order calls, rans pass2 emits
+    pub static CNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static ON: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    #[inline]
+    fn enabled() -> bool {
+        let v = ON.load(Ordering::Relaxed);
+        if v != u64::MAX {
+            return v == 1;
+        }
+        let on = std::env::var_os("FLQ_PROF").is_some() as u64;
+        ON.store(on, Ordering::Relaxed);
+        on == 1
+    }
+
+    #[inline]
+    pub fn time<R>(slot: usize, f: impl FnOnce() -> R) -> R {
+        if !enabled() {
+            return f();
+        }
+        let t = Instant::now();
+        let r = f();
+        NS[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
+    }
+
+    /// `Instant::now()` only when profiling — for hand-timed subsections
+    /// inside `time()` closures so the off path pays nothing.
+    #[inline]
+    pub fn tick() -> Option<Instant> {
+        enabled().then(Instant::now)
+    }
+
+    /// Elapsed-nanos accumulate for a `tick()` mark.
+    #[inline]
+    pub fn add(slot: usize, t: Option<Instant>) {
+        if let Some(t) = t {
+            NS[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Counter bump, free when off.
+    #[inline]
+    pub fn bump(i: usize, v: u64) {
+        if enabled() {
+            CNT[i].fetch_add(v, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump() {
+        if std::env::var_os("FLQ_PROF").is_none() {
+            return;
+        }
+        let mut lines = String::from("FLQ_PROF stage totals (ns):\n");
+        let mut tot = 0u64;
+        for (i, n) in NAMES.iter().enumerate() {
+            let v = NS[i].load(Ordering::Relaxed);
+            tot += v;
+            lines.push_str(&format!("  {n:>14}: {v:>12} ({:.1} ms)\n", v as f64 / 1e6));
+        }
+        lines.push_str(&format!(
+            "  {:>14}: {tot:>12}\n  rans calls {} aborts {} bits {}\n  plan_res calls {}  eval_order calls {}\n",
+            "sum",
+            CNT[0].load(Ordering::Relaxed),
+            CNT[1].load(Ordering::Relaxed),
+            CNT[2].load(Ordering::Relaxed),
+            CNT[3].load(Ordering::Relaxed),
+            CNT[4].load(Ordering::Relaxed)
+        ));
+        eprint!("{lines}");
+    }
+}
 
 // ---------------------------------------------------------------- float
 
@@ -340,6 +442,82 @@ fn predict_at(w: &[i64], i: usize, q: &[i16], qshift: u8) -> i64 {
     s >> qshift
 }
 
+/// Reversed, widened coefficients for `predict_i32`: `qr` is the reversed
+/// taps LEFT-padded with zeros to a multiple of 8, so the dot product
+/// w32[i−o..i]·q reads w32[i−L..i]·qr[0..L] (L = qr.len(), padded lanes
+/// multiply by zero) — one full ymm row per iteration, no scalar tail.
+struct CoefI32 {
+    o: usize,        // real tap count
+    qr: Vec<i32>,    // len = o rounded up to 8
+}
+
+/// Same dot product as `predict_at` over an i32-cast window. Exact vs the
+/// wrapping i64 version because |q·w| ≤ 2^45 and at most 63 terms ⇒
+/// |Σ| < 2^51 — no wrap can ever occur, so lane-summation order cannot
+/// matter.
+#[inline]
+fn predict_i32(w32: &[i32], i: usize, c: &CoefI32, qshift: u8) -> i64 {
+    let l = c.qr.len();
+    #[cfg(target_arch = "x86_64")]
+    if i >= l && is_x86_feature_detected!("avx2") {
+        // SAFETY: feature gate above; i >= l bounds both window/qr loads.
+        return unsafe { dot_i32_avx2(&w32[i - l..i], &c.qr) } >> qshift;
+    }
+    // scalar fallback uses the unpadded tail of qr on the real window
+    let (o, q) = (c.o, &c.qr[l - c.o..]);
+    let w = &w32[i - o..i];
+    let mut s = 0i64;
+    for j in 0..o {
+        s += i64::from(q[j]) * i64::from(w[j]);
+    }
+    s >> qshift
+}
+
+/// Σ_j q[j]·w[j] as i64, `q.len()` a multiple of 8. Exact lane split:
+/// products can't wrap (see `predict_i32`), so per-lane accumulation is
+/// identical to scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i32_avx2(w: &[i32], q: &[i32]) -> i64 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_si256();
+    let mut j = 0;
+    // SAFETY: q.len() % 8 == 0 covers w fully; loads stay inside w/qr.
+    unsafe {
+        while j < q.len() {
+            let wv = _mm256_loadu_si256(w.as_ptr().add(j) as *const __m256i);
+            let qv = _mm256_loadu_si256(q.as_ptr().add(j) as *const __m256i);
+            let pe = _mm256_mul_epi32(wv, qv); // even i32 lanes → i64
+            let po = _mm256_mul_epi32(_mm256_srli_epi64(wv, 32), _mm256_srli_epi64(qv, 32));
+            acc = _mm256_add_epi64(acc, _mm256_add_epi64(pe, po));
+            j += 8;
+        }
+        let mut tmp = [0i64; 4];
+        _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc);
+        tmp[0] + tmp[1] + tmp[2] + tmp[3]
+    }
+}
+
+/// `w` cast to i32 once per signal when every sample fits (float
+/// significand streams don't — callers keep the scalar path then).
+fn w32_of(w: &[i64]) -> Option<Vec<i32>> {
+    if signed_bits(w) > 32 {
+        return None;
+    }
+    Some(w.iter().map(|&v| v as i32).collect())
+}
+
+/// Reversed, widened, left-padded coefficients for `predict_i32`.
+fn qr_of(q: &[i16]) -> CoefI32 {
+    let o = q.len();
+    let l = o.max(1).next_multiple_of(8);
+    let mut qr = vec![0i32; l];
+    for (j, &c) in q.iter().rev().enumerate() {
+        qr[l - o + j] = i32::from(c);
+    }
+    CoefI32 { o, qr }
+}
+
 /// Minimal signed bit width holding every value (1 for empty/all-zero).
 fn signed_bits(vals: &[i64]) -> u8 {
     vals.iter()
@@ -360,7 +538,19 @@ fn signed_bits(vals: &[i64]) -> u8 {
 /// warm-up fields (residual placeholder 0) rather than predictions —
 /// unless their signed width exceeds the 6-bit `wbits` field's 63-bit
 /// maximum, when `warm_wbits` = Some(0) marks "decode normally".
-fn eval_order(w: &[i64], n: usize, o: usize, qshift: u8, q: Vec<i16>, warm: usize) -> SignalPlan {
+#[allow(clippy::too_many_arguments)]
+fn eval_order(
+    w: &[i64],
+    w32: Option<&[i32]>,
+    n: usize,
+    o: usize,
+    qshift: u8,
+    q: Vec<i16>,
+    warm: usize,
+    cap: u64,
+) -> SignalPlan {
+    use std::sync::atomic::Ordering::Relaxed;
+    prof::CNT[4].fetch_add(1, Relaxed);
     let warm = warm.min(n);
     let warm_vals: Vec<i64> = (0..warm).map(|i| w[MAX_ORDER + i]).collect();
     let wbits = signed_bits(&warm_vals);
@@ -373,16 +563,63 @@ fn eval_order(w: &[i64], n: usize, o: usize, qshift: u8, q: Vec<i16>, warm: usiz
     } else {
         (None, Vec::new(), 0)
     };
-    let resid: Vec<i64> = (0..n)
-        .map(|i| {
-            if i < nw {
-                0
-            } else {
-                w[MAX_ORDER + i].wrapping_sub(predict_at(w, MAX_ORDER + i, &q, qshift))
+    let resid: Vec<i64> = prof::time(11, || {
+        if let Some(w32) = w32 {
+            let qr = qr_of(&q);
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") {
+                let l = qr.qr.len();
+                // SAFETY per iter: ix >= l means the padded window load
+                // w32[ix-l..ix] and the full qr rows stay in bounds.
+                return (0..n)
+                    .map(|i| {
+                        let ix = MAX_ORDER + i;
+                        if i < nw || ix < l {
+                            if i < nw {
+                                0
+                            } else {
+                                w[ix].wrapping_sub(predict_i32(w32, ix, &qr, qshift))
+                            }
+                        } else {
+                            w[ix].wrapping_sub(
+                                unsafe { dot_i32_avx2(&w32[ix - l..ix], &qr.qr) } >> qshift,
+                            )
+                        }
+                    })
+                    .collect();
             }
-        })
-        .collect();
-    let rp = plan_residual(&resid);
+            return (0..n)
+                .map(|i| {
+                    if i < nw {
+                        0
+                    } else {
+                        let ix = MAX_ORDER + i;
+                        w[ix].wrapping_sub(predict_i32(w32, ix, &qr, qshift))
+                    }
+                })
+                .collect();
+        }
+        (0..n)
+            .map(|i| {
+                if i < nw {
+                    0
+                } else {
+                    w[MAX_ORDER + i].wrapping_sub(predict_at(w, MAX_ORDER + i, &q, qshift))
+                }
+            })
+            .collect()
+    });
+    // incumbent minus the non-residual fields of cost() — the residual
+    // plan only needs to beat that to matter for this candidate
+    let oh = 6 + 1
+        + 1
+        + if o > 0 {
+            4 + 5 + o as u64 * u64::from(LPC_PREC)
+        } else {
+            0
+        }
+        + warm_wbits.map_or(0, |w| 6 + o as u64 * u64::from(w));
+    let rp = plan_residual_cap(&resid, cap.saturating_sub(oh));
     SignalPlan {
         order: o as u8,
         qshift,
@@ -421,23 +658,35 @@ fn plan_signal_win(w: &[i64], n: usize, preset: u8, win: &[f64], warm: bool) -> 
             rplan: rp,
         }
     };
-    let r = autocorr(blk, win);
+    let r = prof::time(0, || autocorr(blk, win));
     if r[0] == 0.0 {
         return best;
     }
-    let sol = levinson(&r);
+    let sol = prof::time(1, || levinson(&r));
     let cands: Vec<usize> = ORDERS
         .iter()
         .skip(1)
         .copied()
         .filter(|&o| !sol[o].is_empty())
         .collect();
+    let w32 = w32_of(w);
     if preset >= 8 {
         for &o in &cands {
             let Some((qshift, q)) = quantize(&sol[o]) else {
                 continue;
             };
-            let cand = eval_order(w, n, o, qshift, q, if warm { o } else { 0 });
+            let cand = prof::time(3, || {
+                eval_order(
+                    w,
+                    w32.as_deref(),
+                    n,
+                    o,
+                    qshift,
+                    q,
+                    if warm { o } else { 0 },
+                    best.cost(),
+                )
+            });
             if cand.cost() < best.cost() {
                 best = cand;
             }
@@ -450,38 +699,68 @@ fn plan_signal_win(w: &[i64], n: usize, preset: u8, win: &[f64], warm: bool) -> 
         let stride = if preset == 0 { 4 } else { 2 };
         let keep = if preset == 0 { 1 } else { 2 };
         let mut ranked: Vec<(f64, usize, u8, Vec<i16>)> = Vec::with_capacity(cands.len());
-        for &o in &cands {
-            let Some((qshift, q)) = quantize(&sol[o]) else {
-                continue;
-            };
-            // warm-up positions are carried verbatim, not as residuals: skip
-            // them in the mean-|r| estimate and charge `order * wbits` bits
-            let warm_n = (o.min(n)).min(if warm { o } else { 0 });
-            let wbits_est = u64::from(signed_bits(
-                &(0..warm_n).map(|i| w[MAX_ORDER + i]).collect::<Vec<_>>(),
-            ));
-            let warm_n = if wbits_est <= 63 { warm_n } else { 0 };
-            let (mut sum_abs, mut m) = (0u128, 0u64);
-            let mut i = 0;
-            while i < n {
-                if i >= warm_n {
-                    let r_i =
-                        w[MAX_ORDER + i].wrapping_sub(predict_at(w, MAX_ORDER + i, &q, qshift));
-                    sum_abs += u128::from(r_i.unsigned_abs());
-                    m += 1;
+        prof::time(2, || {
+            for &o in &cands {
+                let Some((qshift, q)) = quantize(&sol[o]) else {
+                    continue;
+                };
+                let qr = w32.as_ref().map(|_| qr_of(&q));
+                // warm-up positions are carried verbatim, not as residuals: skip
+                // them in the mean-|r| estimate and charge `order * wbits` bits
+                let warm_n = (o.min(n)).min(if warm { o } else { 0 });
+                let wbits_est = u64::from(signed_bits(
+                    &(0..warm_n).map(|i| w[MAX_ORDER + i]).collect::<Vec<_>>(),
+                ));
+                let warm_n = if wbits_est <= 63 { warm_n } else { 0 };
+                let (mut sum_abs, mut m) = (0u128, 0u64);
+                // same sampled set as stepping from 0 and skipping i < warm_n
+                let i0 = warm_n.next_multiple_of(stride);
+                #[allow(unused_mut)]
+                let mut done = false;
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx2") {
+                    if let (Some(w32), Some(qr)) = (&w32, &qr) {
+                        let l = qr.qr.len();
+                        let mut i = i0;
+                        while i < n {
+                            let ix = MAX_ORDER + i;
+                            // SAFETY: ix >= l bounds the padded window/qr loads
+                            let p = if ix >= l {
+                                (unsafe { dot_i32_avx2(&w32[ix - l..ix], &qr.qr) }) >> qshift
+                            } else {
+                                predict_i32(w32, ix, qr, qshift)
+                            };
+                            sum_abs += u128::from(w[ix].wrapping_sub(p).unsigned_abs());
+                            m += 1;
+                            i += stride;
+                        }
+                        done = true;
+                    }
                 }
-                i += stride;
+                if !done {
+                    let mut i = i0;
+                    while i < n {
+                        let ix = MAX_ORDER + i;
+                        let p = match (&w32, &qr) {
+                            (Some(w32), Some(qr)) => predict_i32(w32, ix, qr, qshift),
+                            _ => predict_at(w, ix, &q, qshift),
+                        };
+                        sum_abs += u128::from(w[ix].wrapping_sub(p).unsigned_abs());
+                        m += 1;
+                        i += stride;
+                    }
+                }
+                let mean = if m > 0 {
+                    sum_abs as f64 / m as f64
+                } else {
+                    0.0
+                };
+                let proxy = n as f64 * dlog2(mean + 1.0)
+                    + o as f64 * f64::from(LPC_PREC)
+                    + o as f64 * wbits_est as f64;
+                ranked.push((proxy, o, qshift, q));
             }
-            let mean = if m > 0 {
-                sum_abs as f64 / m as f64
-            } else {
-                0.0
-            };
-            let proxy = n as f64 * dlog2(mean + 1.0)
-                + o as f64 * f64::from(LPC_PREC)
-                + o as f64 * wbits_est as f64;
-            ranked.push((proxy, o, qshift, q));
-        }
+        });
         ranked.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -494,7 +773,18 @@ fn plan_signal_win(w: &[i64], n: usize, preset: u8, win: &[f64], warm: bool) -> 
             .collect();
         top.sort_unstable_by_key(|&(o, _, _)| o);
         for (o, qshift, q) in top {
-            let cand = eval_order(w, n, o, qshift, q, if warm { o } else { 0 });
+            let cand = prof::time(3, || {
+                eval_order(
+                    w,
+                    w32.as_deref(),
+                    n,
+                    o,
+                    qshift,
+                    q,
+                    if warm { o } else { 0 },
+                    best.cost(),
+                )
+            });
             if cand.cost() < best.cost() {
                 best = cand;
             }
@@ -699,20 +989,28 @@ fn variant_a(
     win: &[f64],
 ) -> VarA {
     let n = e - s;
-    let w: Vec<Vec<i64>> = ctx.x.iter().map(|x| window(x, s, e)).collect();
+    let (w, g4, g5) = prof::time(10, || {
+        let w: Vec<Vec<i64>> = ctx.x.iter().map(|x| window(x, s, e)).collect();
+        let (g4, g5) = if stereo {
+            (gain_coef(&w[0], &w[1]), gain_coef(&w[1], &w[0]))
+        } else {
+            (0, 0)
+        };
+        (w, g4, g5)
+    });
     let warm = s == 0;
     let ps = |wc: &[i64]| plan_signal_win(wc, n, preset, win, warm);
     let raw: Vec<SignalPlan> = w.iter().map(|wc| ps(wc)).collect();
     let (mode_a, gain_a, sigs_a) = if stereo {
-        let sig_s = ps(&sub(&w[0], &w[1]));
-        let sig_m = ps(&mid(&w[0], &w[1]));
+        let sig_s = ps(&prof::time(10, || sub(&w[0], &w[1])));
+        let sig_m = ps(&prof::time(10, || mid(&w[0], &w[1])));
         // adaptive-gain sides: s = other - round(g·kept), g on a 1/128
         // grid. A near-zero gain degenerates to a plain side already
         // covered by modes 1-3 — skip the two extra signal plans then.
-        let g4 = gain_coef(&w[0], &w[1]); // keep L, side = R - g·L
-        let g5 = gain_coef(&w[1], &w[0]); // keep R, side = L - g·R
-        let sig_gr = (g4.abs() >= 4).then(|| ps(&gain_side(&w[0], &w[1], g4)));
-        let sig_gl = (g5.abs() >= 4).then(|| ps(&gain_side(&w[1], &w[0], g5)));
+        let sig_gr = (g4.abs() >= 4)
+            .then(|| ps(&prof::time(10, || gain_side(&w[0], &w[1], g4))));
+        let sig_gl = (g5.abs() >= 4)
+            .then(|| ps(&prof::time(10, || gain_side(&w[1], &w[0], g5))));
         let c = [
             raw[0].cost(),
             raw[1].cost(),
@@ -842,22 +1140,24 @@ pub fn plan_track_with(ctx: &TrackCtx<'_>, preset: u8, threads: usize) -> TrackP
             // the u2 step field must be repaid. Step choice probes a
             // strided subsample — exact cost only for the winning step.
             if sig.rplan.cost > 4096 {
-                let probe: Vec<i64> = sig.resid.iter().step_by(4).copied().collect();
-                let mut si_best = (0u8, u64::MAX);
-                for (idx, &step) in LMS_STEPS.iter().enumerate() {
-                    let ep = lms_forward(&probe, step);
-                    let rp = plan_residual(&ep);
-                    if rp.cost < si_best.1 {
-                        si_best = (idx as u8, rp.cost);
+                prof::time(8, || {
+                    let probe: Vec<i64> = sig.resid.iter().step_by(4).copied().collect();
+                    let mut si_best = (0u8, u64::MAX);
+                    for (idx, &step) in LMS_STEPS.iter().enumerate() {
+                        let ep = lms_forward(&probe, step);
+                        let rp = plan_residual_cap(&ep, si_best.1);
+                        if rp.cost < si_best.1 {
+                            si_best = (idx as u8, rp.cost);
+                        }
                     }
-                }
-                let e3 = lms_forward(&sig.resid, LMS_STEPS[si_best.0 as usize]);
-                let rp3 = plan_residual(&e3);
-                if rp3.cost + 2 < sig.rplan.cost {
-                    sig.lms = Some(si_best.0);
-                    sig.resid = e3;
-                    sig.rplan = rp3;
-                }
+                    let e3 = lms_forward(&sig.resid, LMS_STEPS[si_best.0 as usize]);
+                    let rp3 = plan_residual_cap(&e3, sig.rplan.cost.saturating_sub(2));
+                    if rp3.cost + 2 < sig.rplan.cost {
+                        sig.lms = Some(si_best.0);
+                        sig.resid = e3;
+                        sig.rplan = rp3;
+                    }
+                });
             }
         }
     }
@@ -891,60 +1191,71 @@ fn ltp_try(
         return None;
     }
     // coarse scan: normalized |correlation| on a strided grid
-    let mut best: Option<(f64, usize)> = None;
-    let mut tau = 32usize;
-    while tau <= tau_max {
-        let (mut num, mut d1, mut d2) = (0f64, 0f64, 0f64);
-        let mut i = base;
-        while i < stream.len() {
-            let a = stream[i] as f64;
-            let b = stream[i - tau] as f64;
-            num += a * b;
-            d1 += a * a;
-            d2 += b * b;
-            i += 8;
+    let mut best: Option<(f64, usize)> = prof::time(6, || {
+        let mut best: Option<(f64, usize)> = None;
+        let mut tau = 32usize;
+        while tau <= tau_max {
+            let (mut num, mut d1, mut d2) = (0f64, 0f64, 0f64);
+            let mut i = base;
+            while i < stream.len() {
+                let a = stream[i] as f64;
+                let b = stream[i - tau] as f64;
+                num += a * b;
+                d1 += a * a;
+                d2 += b * b;
+                i += 8;
+            }
+            let score = if d1 > 0.0 && d2 > 0.0 {
+                num.abs() / (d1.sqrt() * d2.sqrt())
+            } else {
+                0.0
+            };
+            if best.is_none_or(|(bs, _)| score > bs) {
+                best = Some((score, tau));
+            }
+            tau += 8;
         }
-        let score = if d1 > 0.0 && d2 > 0.0 {
-            num.abs() / (d1.sqrt() * d2.sqrt())
-        } else {
-            0.0
-        };
-        if best.is_none_or(|(bs, _)| score > bs) {
-            best = Some((score, tau));
-        }
-        tau += 8;
-    }
-    let (score, tau0) = best?;
+        best
+    });
+    let (score, tau0) = best.take()?;
     if score < 0.25 {
         return None; // no real periodicity — skip the exact pass
     }
     let mut out: Option<(u16, i8, Vec<i64>, ResidualPlan, u64)> = None;
-    for tau_c in [tau0.saturating_sub(1), tau0, (tau0 + 1).min(tau_max)] {
-        if tau_c == 0 || tau_c > tau_max {
-            continue;
+    prof::time(7, || {
+        for tau_c in [tau0.saturating_sub(1), tau0, (tau0 + 1).min(tau_max)] {
+            if tau_c == 0 || tau_c > tau_max {
+                continue;
+            }
+            let (mut num, mut den) = (0i128, 0i128);
+            for i in base..stream.len() {
+                let b = stream[i - tau_c];
+                num += stream[i] as i128 * b as i128;
+                den += b as i128 * b as i128;
+            }
+            if den == 0 {
+                continue;
+            }
+            let g = ((num * 128) / den).clamp(-128, 127) as i8;
+            if g == 0 {
+                continue;
+            }
+            let e2: Vec<i64> = (0..n)
+                .map(|i| stream[base + i].wrapping_sub(apply_gain(g, stream[base + i - tau_c])))
+                .collect();
+            // cap = min(running tau best, old_cost - 20): a plan that can
+            // never beat the 20-bit header check is provably dead work
+            let cap = out
+                .as_ref()
+                .map_or(u64::MAX, |o| o.4)
+                .min(old_cost.saturating_sub(20));
+            let rp2 = plan_residual_cap(&e2, cap);
+            let c2 = rp2.cost;
+            if out.as_ref().is_none_or(|o| c2 < o.4) {
+                out = Some((tau_c as u16, g, e2, rp2, c2));
+            }
         }
-        let (mut num, mut den) = (0i128, 0i128);
-        for i in base..stream.len() {
-            let b = stream[i - tau_c];
-            num += stream[i] as i128 * b as i128;
-            den += b as i128 * b as i128;
-        }
-        if den == 0 {
-            continue;
-        }
-        let g = ((num * 128) / den).clamp(-128, 127) as i8;
-        if g == 0 {
-            continue;
-        }
-        let e2: Vec<i64> = (0..n)
-            .map(|i| stream[base + i].wrapping_sub(apply_gain(g, stream[base + i - tau_c])))
-            .collect();
-        let rp2 = plan_residual(&e2);
-        let c2 = rp2.cost;
-        if out.as_ref().is_none_or(|o| c2 < o.4) {
-            out = Some((tau_c as u16, g, e2, rp2, c2));
-        }
-    }
+    });
     let (tau, g, e2, rp2, total) = out?;
     // the 20-bit LTP header (τ u12 + g i8) must be more than repaid
     if total + 20 < old_cost {
@@ -957,6 +1268,10 @@ fn ltp_try(
 // ---------------------------------------------------------------- writing
 
 pub fn write_track(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan) {
+    prof::time(9, || write_track_inner(bw, ctx, plan))
+}
+
+fn write_track_inner(bw: &mut BitWriter, ctx: &TrackCtx<'_>, plan: &TrackPlan) {
     let ch = ctx.x.len();
     let frames = ctx.x.first().map_or(0, |x| x.len());
     let stereo = ch == 2;

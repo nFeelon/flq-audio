@@ -576,9 +576,13 @@ pub fn encode<W: Write + Seek>(
     out.write_all(&0u32.to_le_bytes())
         .map_err(|e| format!("write: {e}"))?; // meta crc placeholder
 
-    // Frame loop: gather frame-major/track-minor jobs in batches of
-    // `threads`, code them in parallel, write in order — byte-identical for
-    // any thread count.
+    // Frame loop: gather is sequential and cheap; coding is the heavy
+    // part and runs on `threads` workers pulling from a bounded queue.
+    // Results carry their gather sequence number; the writer drains them
+    // strictly in order — byte-identical for any thread count — while a
+    // straggler frame only stalls the writer, never the workers.
+    // Outstanding jobs are capped by the channel bound, keeping peak
+    // memory at O(threads * frame).
     let mut pcm_crcs: Vec<Crc32> = srcs.iter().map(|_| Crc32::new()).collect();
     let mut done: Vec<u64> = vec![0; srcs.len()]; // frames consumed per track
     let mut enc_n: Vec<u64> = vec![0; srcs.len()]; // samples actually coded
@@ -593,73 +597,179 @@ pub fn encode<W: Write + Seek>(
             })
         })
         .collect();
-    // One queued job per worker: gather is sequential anyway, so deeper
-    // queues only hold finished frames hostage in memory.
-    let batch_n = threads.max(1);
-    let mut batch: Vec<Job> = Vec::with_capacity(batch_n);
 
-    let flush = |batch: &mut Vec<Job>,
-                 out: &mut W,
-                 coded: &mut [u64],
-                 index: &mut [Vec<u64>]|
+    let write_rec = |j: &Job,
+                     p: &[u8],
+                     out: &mut W,
+                     coded: &mut [u64],
+                     index: &mut [Vec<u64>]|
      -> Result<(), String> {
-        let payloads: Vec<Vec<u8>> = if threads > 1 && batch.len() > 1 {
-            let chunk = batch.len().div_ceil(threads.min(batch.len()));
-            let mut slots: Vec<Option<Vec<u8>>> = batch.iter().map(|_| None).collect();
-            let jobs = &*batch;
-            std::thread::scope(|sc| {
-                let mut at = 0usize;
-                for slice in slots.chunks_mut(chunk) {
-                    let base = at;
-                    at += slice.len();
-                    sc.spawn(move || {
-                        for (i, slot) in slice.iter_mut().enumerate() {
-                            *slot = Some(code_job(&jobs[base + i], opts.preset));
-                        }
-                    });
-                }
-            });
-            slots.into_iter().map(|s| s.unwrap()).collect()
-        } else {
-            batch.iter().map(|j| code_job(j, opts.preset)).collect()
-        };
-        for (j, p) in batch.drain(..).zip(payloads) {
-            let off = out.stream_position().map_err(|e| format!("seek: {e}"))?;
-            let rec = frame_record(&j, &p);
-            coded[j.track] += rec.len() as u64;
-            index[j.track].push(off);
-            out.write_all(&rec).map_err(|e| format!("write: {e}"))?;
-        }
+        let off = out.stream_position().map_err(|e| format!("seek: {e}"))?;
+        let rec = frame_record(j, p);
+        coded[j.track] += rec.len() as u64;
+        index[j.track].push(off);
+        out.write_all(&rec).map_err(|e| format!("write: {e}"))?;
         Ok(())
     };
 
-    let mut f = 0u32;
-    'frames: loop {
-        let mut any = false;
-        for (t, s) in srcs.iter_mut().enumerate() {
-            if u64::from(f) >= s.nframes(fl) as u64 || done[t] >= s.frames {
-                continue;
+    let preset = opts.preset;
+    if threads > 1 {
+        use std::collections::BTreeMap;
+        use std::sync::mpsc::{TryRecvError, TrySendError, sync_channel};
+        use std::sync::{Arc, Mutex};
+        // bounded both ways: queued jobs and undrained results are each
+        // capped at `threads` — peak memory stays O(threads * frame).
+        // Errors go to `fatal` (never `?`): the scope must keep draining
+        // so workers always see the job channel close and exit for join.
+        let (job_tx, job_rx) = sync_channel::<(u64, Job)>(threads);
+        let (res_tx, res_rx) = sync_channel::<(u64, Job, Vec<u8>)>(threads);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let mut fatal: Option<String> = None;
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                let (rx, tx) = (Arc::clone(&job_rx), res_tx.clone());
+                sc.spawn(move || {
+                    loop {
+                        let msg = rx.lock().expect("job queue poisoned").recv();
+                        let Ok((seq, j)) = msg else { break };
+                        let p = code_job(&j, preset);
+                        if tx.send((seq, j, p)).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
-            let n = (s.frames - done[t]).min(u64::from(fl)) as usize;
-            match gather(t, f, n, s, &mut pcm_crcs[t])? {
-                Some(job) => {
-                    done[t] += u64::from(job.n);
-                    enc_n[t] += u64::from(job.n);
-                    batch.push(job);
+            drop(res_tx);
+            let (mut seq, mut next) = (0u64, 0u64);
+            let mut pending: BTreeMap<u64, (Job, Vec<u8>)> = BTreeMap::new();
+            let mut closed = false;
+            // drain: collect arrived results, write strictly in order.
+            // wait = block until one more result arrives (backpressure
+            // while the job queue is full). Returns res-channel closed.
+            let mut drain = |next: &mut u64, fatal: &mut Option<String>, wait: bool| -> bool {
+                if wait && !closed {
+                    match res_rx.recv() {
+                        Ok((s, j, p)) => {
+                            pending.insert(s, (j, p));
+                        }
+                        Err(_) => closed = true,
+                    }
                 }
-                None => done[t] = s.frames,
+                loop {
+                    match res_rx.try_recv() {
+                        Ok((s, j, p)) => {
+                            pending.insert(s, (j, p));
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            closed = true;
+                            break;
+                        }
+                    }
+                }
+                while let Some((j, p)) = pending.remove(next) {
+                    if fatal.is_none() {
+                        if let Err(e) = write_rec(&j, &p, out, &mut coded, &mut index) {
+                            *fatal = Some(e);
+                        }
+                    }
+                    *next += 1;
+                }
+                closed
+            };
+            let mut f = 0u32;
+            'frames: loop {
+                let mut any = false;
+                for (t, s) in srcs.iter_mut().enumerate() {
+                    if u64::from(f) >= s.nframes(fl) as u64 || done[t] >= s.frames {
+                        continue;
+                    }
+                    let n = (s.frames - done[t]).min(u64::from(fl)) as usize;
+                    match gather(t, f, n, s, &mut pcm_crcs[t]) {
+                        Err(e) => {
+                            fatal = Some(e);
+                            break 'frames;
+                        }
+                        Ok(None) => done[t] = s.frames,
+                        Ok(Some(job)) => {
+                            done[t] += u64::from(job.n);
+                            enc_n[t] += u64::from(job.n);
+                            // bounded send: a full job queue may mean
+                            // workers are parked on the results channel —
+                            // drain first so the send can't wait forever
+                            let mut msg = (seq, job);
+                            loop {
+                                match job_tx.try_send(msg) {
+                                    Ok(()) => break,
+                                    Err(TrySendError::Full(m)) => {
+                                        msg = m;
+                                        if drain(&mut next, &mut fatal, true) {
+                                            fatal = Some(
+                                                "encoder workers stopped".into(),
+                                            );
+                                            break 'frames;
+                                        }
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        fatal =
+                                            Some("encoder workers stopped".into());
+                                        break 'frames;
+                                    }
+                                }
+                            }
+                            seq += 1;
+                        }
+                    }
+                    any = true;
+                }
+                if !any {
+                    break 'frames;
+                }
+                f += 1;
+                drain(&mut next, &mut fatal, false);
             }
-            any = true;
+            drop(job_tx);
+            // workers code the remaining queue; drain until done or a
+            // lost job (closed channel + no progress) gives up
+            while next < seq {
+                let before = next;
+                if drain(&mut next, &mut fatal, true) && next == before {
+                    break;
+                }
+            }
+            if next < seq && fatal.is_none() {
+                fatal = Some("encoder workers stopped".into());
+            }
+        });
+        if let Some(e) = fatal {
+            return Err(e);
         }
-        if !any {
-            break 'frames;
+    } else {
+        let mut f = 0u32;
+        'frames: loop {
+            let mut any = false;
+            for (t, s) in srcs.iter_mut().enumerate() {
+                if u64::from(f) >= s.nframes(fl) as u64 || done[t] >= s.frames {
+                    continue;
+                }
+                let n = (s.frames - done[t]).min(u64::from(fl)) as usize;
+                match gather(t, f, n, s, &mut pcm_crcs[t])? {
+                    Some(job) => {
+                        done[t] += u64::from(job.n);
+                        enc_n[t] += u64::from(job.n);
+                        let p = code_job(&job, preset);
+                        write_rec(&job, &p, out, &mut coded, &mut index)?;
+                    }
+                    None => done[t] = s.frames,
+                }
+                any = true;
+            }
+            if !any {
+                break 'frames;
+            }
+            f += 1;
         }
-        if batch.len() >= batch_n {
-            flush(&mut batch, out, &mut coded, &mut index)?;
-        }
-        f += 1;
     }
-    flush(&mut batch, out, &mut coded, &mut index)?;
 
     // Declared counts must match what was actually decoded: STREAMINFO /
     // stsz can lie in either direction (streamed reads would silently

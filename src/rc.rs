@@ -15,14 +15,56 @@ const L: u64 = 1 << 24;
 /// x_max factor: emit while `x >= p * (1 << 28)`.
 const XMAX_SHIFT: u32 = 28;
 
+/// Exact floor(x/d) via multiply-high for d < TOT, x < 2^52:
+/// m = ceil(2^64/d) ⇒ m·d − 2^64 < d, and x·(m·d−2^64)/d < 1/d·x < 2^52·…
+/// suffices to never cross an integer boundary. Compiled table.
+const fn magics() -> [u64; TOT as usize] {
+    let mut t = [0u64; TOT as usize];
+    let mut d = 1usize;
+    while d < TOT as usize {
+        t[d] = (1u128 << 64).div_ceil(d as u128) as u64;
+        d += 1;
+    }
+    t
+}
+static MAGIC: [u64; TOT as usize] = magics();
+
+#[inline]
+fn mulhi(x: u64, m: u64) -> u64 {
+    ((x as u128 * m as u128) >> 64) as u64
+}
+
+/// `adapt` as a transition table: ADAPT[bit][p] = next p. 16 KiB,
+/// L1-resident; identical to the shift-register formula, one load per bit.
+const fn adapt_tab(bit: u32) -> [u16; TOT as usize] {
+    let mut t = [0u16; TOT as usize];
+    let mut p = 0usize;
+    while p < TOT as usize {
+        let pi = p as i32;
+        let v = pi + ((bit as i32 * TOT as i32 - pi) >> 4);
+        let v = if v < 4 {
+            4
+        } else if v > TOT as i32 - 4 {
+            TOT as i32 - 4
+        } else {
+            v
+        };
+        t[p] = v as u16;
+        p += 1;
+    }
+    t
+}
+static ADAPT0: [u16; TOT as usize] = adapt_tab(0);
+static ADAPT1: [u16; TOT as usize] = adapt_tab(1);
+
 /// Per-context adaptive probability of a 1-bit (kept 4..TOT-4).
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct ProbBin {
     p: u16, // P(bit=1) * TOT
 }
 
 impl ProbBin {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { p: TOT as u16 / 2 }
     }
     #[inline]
@@ -32,27 +74,71 @@ impl ProbBin {
     /// Shift-register adaptation (rate 1/16).
     #[inline]
     pub fn adapt(&mut self, bit: u8) {
-        let p = i32::from(self.p);
-        let target = if bit == 1 { TOT as i32 } else { 0 };
-        self.p = (p + ((target - p) >> 4)).clamp(4, TOT as i32 - 4) as u16;
+        self.p = if bit == 1 {
+            ADAPT1[self.p as usize]
+        } else {
+            ADAPT0[self.p as usize]
+        };
+    }
+    /// One fused get+adapt step: returns the current prob, advances on a
+    /// 0-bit. Hot encoder path — one load + one store instead of two.
+    #[inline]
+    pub fn step0(&mut self) -> u16 {
+        let p = self.p;
+        self.p = ADAPT0[p as usize];
+        p
+    }
+    #[inline]
+    pub fn step1(&mut self) -> u16 {
+        let p = self.p;
+        self.p = ADAPT1[p as usize];
+        p
+    }
+}
+
+/// Cell sink for `RcEnc`: `Vec<u16>` keeps the blob (exact encodes),
+/// `u64` just counts cells (probes — only the length feeds the estimate,
+/// so the cells are never materialized).
+pub trait Cells {
+    fn push(&mut self, c: u16);
+    fn len(&self) -> usize;
+}
+impl Cells for Vec<u16> {
+    #[inline]
+    fn push(&mut self, c: u16) {
+        Vec::push(self, c);
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+impl Cells for u64 {
+    #[inline]
+    fn push(&mut self, _: u16) {
+        *self += 1;
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        *self as usize
     }
 }
 
 /// rANS encoder: `put_prob` appends one bit coded with probability `p1`
 /// (P(bit=1)·TOT) — feed bits in reverse order with the probabilities a
 /// forward model pass recorded.
-pub struct RcEnc {
+pub struct RcEnc<S: Cells = Vec<u16>> {
     x: u64,
-    out: Vec<u16>,
+    out: S,
 }
 
-impl Default for RcEnc {
+impl Default for RcEnc<Vec<u16>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RcEnc {
+impl RcEnc<Vec<u16>> {
     pub fn new() -> Self {
         Self {
             x: L,
@@ -60,6 +146,31 @@ impl RcEnc {
         }
     }
 
+    pub fn with_capacity(cells: usize) -> Self {
+        Self {
+            x: L,
+            out: Vec::with_capacity(cells),
+        }
+    }
+
+    /// Flush: append the final state (3 u16 cells cover x < 2^44).
+    pub fn finish(mut self) -> Vec<u16> {
+        for _ in 0..3 {
+            self.out.push((self.x & 0xFFFF) as u16);
+            self.x >>= 16;
+        }
+        self.out
+    }
+}
+
+impl RcEnc<u64> {
+    /// Counting encoder: emits into a cell counter, no blob storage.
+    pub fn counting() -> Self {
+        Self { x: L, out: 0 }
+    }
+}
+
+impl<S: Cells> RcEnc<S> {
     #[inline]
     pub fn put_prob(&mut self, p1: u32, bit: u8) {
         let (f, cum) = if bit == 1 {
@@ -72,16 +183,14 @@ impl RcEnc {
             self.out.push((self.x & 0xFFFF) as u16);
             self.x >>= 16;
         }
-        self.x = (self.x / u64::from(f)) * u64::from(TOT) + u64::from(cum) + self.x % u64::from(f);
+        let q = mulhi(self.x, MAGIC[f as usize]); // floor(x / f), exact for x < 2^52
+        self.x = q * u64::from(TOT) + u64::from(cum) + (self.x - q * u64::from(f));
     }
 
-    /// Flush: append the final state (3 u16 cells cover x < 2^44).
-    pub fn finish(mut self) -> Vec<u16> {
-        for _ in 0..3 {
-            self.out.push((self.x & 0xFFFF) as u16);
-            self.x >>= 16;
-        }
-        self.out
+    /// Cells emitted so far (final blob adds 3 more at `finish`).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.out.len()
     }
 }
 
@@ -152,7 +261,7 @@ mod tests {
             let bits: Vec<u8> = (0..n).map(|_| (rng() % 3 == 0) as u8).collect();
             let ctx = |i: usize| (i + 1).min(63);
             // pass 1 (forward): adapt contexts, record per-bit probabilities
-            let mut ctxs = vec![ProbBin::new(); 64];
+            let mut ctxs = [ProbBin::new(); 64];
             let probs: Vec<u16> = bits
                 .iter()
                 .enumerate()
@@ -169,7 +278,7 @@ mod tests {
             }
             let blob = enc.finish();
             // decode forward
-            let mut ctxs = vec![ProbBin::new(); 64];
+            let mut ctxs = [ProbBin::new(); 64];
             let mut dec = RcDec::new(&blob).unwrap();
             for i in 0..n {
                 assert_eq!(dec.get(&mut ctxs[ctx(i)]), bits[i], "n={n} bit {i}");
